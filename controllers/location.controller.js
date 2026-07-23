@@ -38,51 +38,6 @@ const fetchAssetLocations = async () => {
   }
 };
 
-// const fetchMapDetails = async (mapId) => {
-//   try {
-//     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
-//     console.log(`🗺️ Fetching map details for ${mapId}:`, url);
-//     const response = await axios.get(url, {
-//       headers: getMistHeaders(),
-//     });
-
-//     console.log("📋 Map details received:", {
-//       id: response.data.id,
-//       name: response.data.name,
-//       ppm: response.data.ppm,
-//       origin_x: response.data.origin_x,
-//       origin_y: response.data.origin_y,
-//       width: response.data.width,
-//       height: response.data.height,
-//     });
-
-//     return {
-//       id: response.data.id,
-//       name: response.data.name,
-//       width: response.data.width,
-//       height: response.data.height,
-//       ppm: response.data.ppm,
-//       origin_x: response.data.origin_x,
-//       origin_y: response.data.origin_y,
-//       orientation: response.data.orientation,
-//       created_time: response.data.created_time,
-//       modified_time: response.data.modified_time,
-//       type: response.data.type,
-//       width_m: response.data.width_m,
-//       height_m: response.data.height_m,
-//       site_id: response.data.site_id,
-//       org_id: response.data.org_id,
-//       url: response.data.url,
-//       thumbnail_url: response.data.thumbnail_url,
-//       mapstack_id: response.data.mapstack_id,
-//       mapstack_floor: response.data.mapstack_floor,
-//     };
-//   } catch (error) {
-//     console.error("❌ Map API Error:", error.response?.data || error.message);
-//     return null;
-//   }
-// };
-
 // ============================
 // FIXED: WAYFINDING PATH HELPERS
 // ============================
