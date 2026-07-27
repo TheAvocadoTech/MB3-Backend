@@ -1,35 +1,52 @@
-const axios = require("axios");
+// index.js or main application file
+const assetTracker = require("./src/services/mistAssetTracker");
 
-const SITE_ID = process.env.MIST_SITE_ID;
-
-const mist = axios.create({
-  baseURL: "https://api.mist.com/api/v1",
-  headers: {
-    Authorization: `Token ${process.env.MIST_API_TOKEN}`,
-    "Content-Type": "application/json",
-  },
-});
-
-async function getAssets() {
+// Example usage with polling
+async function updateAssets() {
   try {
-    console.log("SITE_ID:", SITE_ID);
+    const processedAssets = await assetTracker.getAssets();
 
-    const url = `/sites/${SITE_ID}/stats/assets`;
-    console.log("Calling:", url);
+    // Process the smoothed asset data
+    console.log(`Processed ${processedAssets.length} assets`);
 
-    const response = await mist.get(url);
+    // Access individual asset states
+    const allStates = assetTracker.getAssetStates();
+    for (const [mac, state] of Object.entries(allStates)) {
+      console.log(`Asset ${mac}:`, {
+        position: state.position,
+        stability: state.stabilityScore,
+        lastUpdate: new Date(state.lastUpdate).toISOString(),
+      });
+    }
 
-    return response.data;
-  } catch (err) {
-    console.error("Mist API Error");
-    console.error("Status:", err.response?.status);
-    console.error("Data:", err.response?.data);
-    console.error("URL:", err.config?.url);
-
-    throw err;
+    return processedAssets;
+  } catch (error) {
+    console.error("Failed to update assets:", error);
+    throw error;
   }
 }
 
+// Listen for real-time asset updates
+assetTracker.on("assetUpdate", (update) => {
+  console.log(`Asset ${update.mac} updated:`, {
+    position: update.position,
+    stability: update.stability,
+    ap: update.raw.ap_mac,
+    rssi: update.raw.rssi,
+  });
+
+  // You can emit this to your frontend via WebSocket
+  // socketIo.emit('assetLocation', update);
+});
+
+// Run update every 5 seconds
+setInterval(updateAssets, 5000);
+
+// Initial update
+updateAssets();
+
+// Export for use in other modules
 module.exports = {
-  getAssets,
+  assetTracker,
+  updateAssets,
 };

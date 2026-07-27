@@ -9,6 +9,7 @@ const PDFDocument = require("pdfkit");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 const axios = require("axios");
+const AssetTracker = require("../services/mistAssetTracker");
 
 // ============================
 // MIST API CONFIGURATION
@@ -36,6 +37,45 @@ const transporter = nodemailer.createTransport({
 });
 
 // ============================
+// MAP CONFIGURATIONS
+// ============================
+
+const MAP_CONFIGS = {
+  "30141417-44ea-4982-993c-6225c9f08315": {
+    name: "MB3-F00",
+    width: 6400,
+    height: 5120,
+    width_m: 127.81105527098556,
+    height_m: 102.24884421678846,
+    origin_x: 306.45106507695385,
+    origin_y: 3856.483584010582,
+    ppm: 50.07391564392213,
+  },
+};
+
+// Beam angles for direction estimation
+const BEAM_ANGLES = {
+  0: 0,
+  1: 20,
+  2: 40,
+  3: 60,
+  4: 80,
+  5: 100,
+  6: 120,
+  7: 140,
+  8: 160,
+  9: 180,
+  10: 200,
+  11: 220,
+  12: 240,
+  13: 260,
+  14: 280,
+  15: 300,
+  16: 320,
+  17: 340,
+};
+
+// ============================
 // MIST API HELPERS
 // ============================
 
@@ -46,14 +86,15 @@ const getMistHeaders = () => ({
 
 const fetchAssetLocations = async () => {
   try {
+    const processedAssets = await AssetTracker.getAssets();
+    return processedAssets;
+  } catch (error) {
+    console.error("Mist API Error:", error.response?.data || error.message);
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
     const response = await axios.get(url, {
       headers: getMistHeaders(),
     });
     return response.data;
-  } catch (error) {
-    console.error("Mist API Error:", error.response?.data || error.message);
-    throw error;
   }
 };
 
@@ -68,6 +109,28 @@ const fetchMapDetails = async (mapId) => {
     console.error("Map API Error:", error.response?.data || error.message);
     return null;
   }
+};
+
+// ============================
+// COORDINATE CONVERSION HELPERS
+// ============================
+
+const convertMistToWorld = (pixelX, pixelY, mapId) => {
+  const mapConfig = MAP_CONFIGS[mapId];
+  if (!mapConfig) {
+    console.warn(`Unknown map_id: ${mapId}, using raw coordinates`);
+    return { x: pixelX, z: pixelY, y: 0.1 };
+  }
+
+  const { origin_x, origin_y, ppm } = mapConfig;
+  const realX = (pixelX - origin_x) / ppm;
+  const realZ = -(pixelY - origin_y) / ppm;
+
+  return {
+    x: realX,
+    z: realZ,
+    y: 0.1,
+  };
 };
 
 // ============================
@@ -115,7 +178,7 @@ const findValidVisitorByToken = async (token) => {
 };
 
 // ============================
-// PDF GENERATION HELPER - UPDATED WITH LARGER QR CODE
+// PDF GENERATION HELPER
 // ============================
 
 const generateVisitorPDF = async (visitorData, qrCodeImage) => {
@@ -137,7 +200,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         resolve(pdfData);
       });
 
-      // ===== HEADER - COMPACT =====
       doc
         .fontSize(22)
         .font("Helvetica-Bold")
@@ -152,7 +214,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .text("Visitor Management System", { align: "center" })
         .moveDown(0.3);
 
-      // Thin divider
       doc
         .strokeColor("#1a237e")
         .lineWidth(1.5)
@@ -161,7 +222,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .stroke()
         .moveDown(0.5);
 
-      // ===== VISITOR DETAILS - COMPACT SINGLE LINE =====
       doc
         .fontSize(9)
         .font("Helvetica-Bold")
@@ -194,7 +254,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .text(new Date(visitorData.qrExpiresAt).toLocaleString())
         .moveDown(0.5);
 
-      // Thin divider
       doc
         .strokeColor("#ddd")
         .lineWidth(1)
@@ -203,7 +262,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .stroke()
         .moveDown(0.8);
 
-      // ===== LARGE QR CODE - TAKES MOST OF THE PAGE =====
       doc
         .font("Helvetica-Bold")
         .fontSize(12)
@@ -211,7 +269,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .text("📱 SCAN QR CODE", { align: "center" })
         .moveDown(0.5);
 
-      // Calculate position for MAXIMUM QR size
       const pageWidth = doc.page.width;
       const pageHeight = doc.page.height;
       const availableHeight = pageHeight - doc.y - 100;
@@ -234,7 +291,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
 
       doc.moveDown(1);
 
-      // ===== QR CODE LABEL =====
       doc
         .fontSize(8)
         .font("Helvetica")
@@ -242,7 +298,6 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .text(`Token: ${visitorData.qrToken}`, { align: "center" })
         .moveDown(0.5);
 
-      // ===== FOOTER =====
       doc
         .strokeColor("#ddd")
         .lineWidth(1)
@@ -302,9 +357,10 @@ const generateVisitorToken = (visitorId) => {
 };
 
 // ============================
-// AUTHENTICATION MIDDLEWARE
+// CONTROLLER FUNCTIONS
 // ============================
 
+// ===== AUTHENTICATION MIDDLEWARE =====
 exports.verifyVisitorToken = (req, res, next) => {
   try {
     const token = req.headers.authorization?.split(" ")[1] || req.query.token;
@@ -339,10 +395,7 @@ exports.verifyVisitorToken = (req, res, next) => {
   }
 };
 
-// ============================
-// CREATE VISITOR
-// ============================
-
+// ===== CREATE VISITOR =====
 exports.createVisitor = async (req, res) => {
   try {
     const {
@@ -424,10 +477,7 @@ exports.createVisitor = async (req, res) => {
   }
 };
 
-// ============================
-// BULK CREATE VISITORS
-// ============================
-
+// ===== BULK CREATE VISITORS =====
 exports.bulkCreateVisitors = async (req, res) => {
   try {
     const visitorsData = req.body;
@@ -526,10 +576,7 @@ exports.bulkCreateVisitors = async (req, res) => {
   }
 };
 
-// ============================
-// GET ALL VISITORS
-// ============================
-
+// ===== GET ALL VISITORS =====
 exports.getAllVisitors = async (req, res) => {
   try {
     const { status = "all", page = 1, limit = 10, search } = req.query;
@@ -582,10 +629,7 @@ exports.getAllVisitors = async (req, res) => {
   }
 };
 
-// ============================
-// GET VISITOR BY ID
-// ============================
-
+// ===== GET VISITOR BY ID =====
 exports.getVisitorById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -619,10 +663,7 @@ exports.getVisitorById = async (req, res) => {
   }
 };
 
-// ============================
-// GET VISITOR BY TOKEN
-// ============================
-
+// ===== GET VISITOR BY TOKEN =====
 exports.getVisitorByToken = async (req, res) => {
   try {
     const { token } = req.params;
@@ -653,28 +694,13 @@ exports.getVisitorByToken = async (req, res) => {
   }
 };
 
-// ============================
-// SEND QR WITH PDF VIA EMAIL
-// ============================
-
+// ===== SEND QR WITH PDF VIA EMAIL =====
 exports.sendQR = async (req, res) => {
   const { id } = req.params;
   const { email } = req.body;
-  console.log(
-    `TRACE: [Backend Controller] API request received at POST /visitors/${id}/send-qr.`,
-  );
-  console.log(
-    "TRACE: [Backend Controller] Params ID:",
-    id,
-    "Request body Email:",
-    email,
-  );
 
   try {
     if (!mongoose.Types.ObjectId.isValid(id)) {
-      console.log(
-        "TRACE: [Backend Controller] Validation failed: Invalid visitor ID format.",
-      );
       return res.status(400).json({
         success: false,
         message: "Invalid visitor ID",
@@ -684,24 +710,13 @@ exports.sendQR = async (req, res) => {
     const visitor = await QRModel.findById(id);
 
     if (!visitor) {
-      console.log(
-        "TRACE: [Backend Controller] DB Lookup failed: Visitor not found in database.",
-      );
       return res.status(404).json({
         success: false,
         message: "Visitor not found",
       });
     }
 
-    console.log(
-      "TRACE: [Backend Controller] Visitor record located successfully:",
-      visitor.visitorName,
-    );
-
     if (visitor.isExpired()) {
-      console.log(
-        "TRACE: [Backend Controller] Access validation failed: QR pass has expired.",
-      );
       return res.status(400).json({
         success: false,
         message: "QR code has expired. Please generate a new one.",
@@ -709,29 +724,15 @@ exports.sendQR = async (req, res) => {
     }
 
     const recipientEmail = email || visitor.email;
-    console.log(
-      "TRACE: [Backend Controller] Calculated recipient email:",
-      recipientEmail,
-    );
     if (!recipientEmail) {
-      console.log(
-        "TRACE: [Backend Controller] Access validation failed: No target email address found.",
-      );
       return res.status(400).json({
         success: false,
         message: "Email address is required to send QR code",
       });
     }
 
-    // Generate temporary password and token for visitor login
     const tempPassword = generateTemporaryPassword();
     const visitorToken = generateVisitorToken(visitor._id);
-    console.log(
-      "TRACE: [Backend Controller] Generated temp portal password:",
-      tempPassword,
-    );
-
-    // Hash the temporary password
     const hashedPassword = await bcrypt.hash(tempPassword, 10);
 
     visitor.tempLoginToken = visitorToken;
@@ -739,156 +740,19 @@ exports.sendQR = async (req, res) => {
     visitor.tempPasswordCreated = new Date();
     visitor.qrSentViaEmail = true;
     await visitor.save();
-    console.log(
-      "TRACE: [Backend Controller] Temporary portal password hashed & updated in DB successfully.",
-    );
 
-    // Generate PDF with LARGE QR code
-    console.log("📄 Generating PDF with large QR code...");
     const pdfBuffer = await generateVisitorPDF(visitor, visitor.qrCode);
-    console.log(
-      `✅ PDF generated successfully! Size: ${(pdfBuffer.length / 1024).toFixed(2)} KB`,
-    );
-
-    // Prepare email with PDF attachment
-    console.log(
-      "TRACE: [Backend Controller] Preparing email transporter options using SMTP configuration...",
-    );
-    console.log(
-      "TRACE: [Backend Controller] SMTP Host:",
-      process.env.SMTP_HOST || "smtp.gmail.com",
-    );
-    console.log(
-      "TRACE: [Backend Controller] SMTP Port:",
-      process.env.SMTP_PORT || "465",
-    );
-    console.log(
-      "TRACE: [Backend Controller] SMTP Sender (From):",
-      process.env.SMTP_FROM || "sonutech04@gmail.com",
-    );
 
     const mailOptions = {
       from: `"Visitor Management System" <${process.env.SMTP_FROM || "sonutech04@gmail.com"}>`,
       to: recipientEmail,
       subject: `📄 Your Visitor Pass with QR Code - ${visitor.visitorName}`,
       html: `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <style>
-            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
-            .header { background: linear-gradient(135deg, #1a237e, #283593); color: white; padding: 25px; border-radius: 12px 12px 0 0; }
-            .header h1 { margin: 0; font-size: 28px; }
-            .header p { margin: 5px 0 0 0; opacity: 0.9; }
-            .content { background: #f5f5f5; padding: 30px; border-radius: 0 0 12px 12px; }
-            .details { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-            .details h3 { margin-top: 0; color: #1a237e; }
-            .detail-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #eee; }
-            .detail-row:last-child { border-bottom: none; }
-            .detail-label { font-weight: bold; color: #555; }
-            .detail-value { color: #000; }
-            .login-info { background: #e8f5e9; padding: 20px; border-radius: 8px; border-left: 4px solid #2e7d32; margin: 20px 0; }
-            .login-info h3 { margin-top: 0; color: #2e7d32; }
-            .password-box { background: white; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 20px; letter-spacing: 2px; display: inline-block; border: 2px dashed #2e7d32; }
-            .button { display: inline-block; padding: 12px 30px; background: linear-gradient(135deg, #1a237e, #283593); color: white; text-decoration: none; border-radius: 6px; margin: 10px 0; }
-            .footer { margin-top: 20px; font-size: 12px; color: #888; text-align: center; border-top: 1px solid #ddd; padding-top: 20px; }
-            .attachment-note { background: #fff3e0; padding: 15px; border-radius: 8px; border-left: 4px solid #e65100; margin: 20px 0; }
-            .qr-size-badge { display: inline-block; background: #e8f5e9; color: #2e7d32; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <h1>🎫 Your Visitor Pass</h1>
-            <p>QR Code attached as PDF</p>
-          </div>
-          <div class="content">
-            <h2>Hello ${visitor.visitorName},</h2>
-            <p>Your visitor pass has been generated with a <strong>large, scannable QR code</strong>.</p>
-            
-            <div class="details">
-              <h3>📋 Visitor Details</h3>
-              <div class="detail-row">
-                <span class="detail-label">Name:</span>
-                <span class="detail-value">${visitor.visitorName}</span>
-              </div>
-              <div class="detail-row">
-                <span class="detail-label">Phone:</span>
-                <span class="detail-value">${visitor.phoneNumber}</span>
-              </div>
-              ${
-                visitor.email
-                  ? `
-              <div class="detail-row">
-                <span class="detail-label">Email:</span>
-                <span class="detail-value">${visitor.email}</span>
-              </div>`
-                  : ""
-              }
-              ${
-                visitor.company
-                  ? `
-              <div class="detail-row">
-                <span class="detail-label">Company:</span>
-                <span class="detail-value">${visitor.company}</span>
-              </div>`
-                  : ""
-              }
-              ${
-                visitor.idNumber
-                  ? `
-              <div class="detail-row">
-                <span class="detail-label">ID Number:</span>
-                <span class="detail-value">${visitor.idNumber}</span>
-              </div>`
-                  : ""
-              }
-              <div class="detail-row">
-                <span class="detail-label">Valid Until:</span>
-                <span class="detail-value">${new Date(visitor.qrExpiresAt).toLocaleString()}</span>
-              </div>
-              <div class="detail-row">
-                <span class="detail-label">Status:</span>
-                <span class="detail-value">${visitor.checkedIn ? "✅ Checked In" : "⏳ Pending"}</span>
-              </div>
-            </div>
-
-            <div class="attachment-note">
-              <strong>📎 PDF Attachment</strong>
-              <br>
-              <span style="font-size: 13px; color: #555;">
-                Your visitor pass with <strong>large QR code (280px)</strong> is attached as a PDF file.
-              </span>
-              <br>
-              <span class="qr-size-badge">📱 Large QR Code - Easy to Scan</span>
-            </div>
-
-            <div class="login-info">
-              <h3>🔐 Visitor Portal Access</h3>
-              <p>You can login to your visitor portal using these credentials:</p>
-              <p><strong>Email:</strong> ${recipientEmail}</p>
-              <p><strong>Temporary Password:</strong></p>
-              <div class="password-box">${tempPassword}</div>
-              <p style="font-size: 14px; color: #555; margin-top: 10px;">Please change your password after first login.</p>
-              <a href="${process.env.FRONTEND_URL || "http://localhost:3000"}/visitor/login?token=${visitorToken}" class="button">
-                🔑 Login to Visitor Portal
-              </a>
-            </div>
-
-            <h3>📌 Instructions:</h3>
-            <ol>
-              <li>Open the attached PDF file</li>
-              <li>Scan the <strong>large QR code</strong></li>
-              <li>Use the temporary password to login to your visitor portal</li>
-              <li>Keep this pass with you during your visit</li>
-            </ol>
-
-            <div class="footer">
-              <p>This is an automated message. Please do not reply to this email.</p>
-              <p>© ${new Date().getFullYear()} Visitor Management System. All rights reserved.</p>
-            </div>
-          </div>
-        </body>
-        </html>
+        <h1>Your Visitor Pass</h1>
+        <p>Hello ${visitor.visitorName},</p>
+        <p>Your visitor pass has been generated with a QR code.</p>
+        <p><strong>Temporary Password:</strong> ${tempPassword}</p>
+        <p><a href="${process.env.FRONTEND_URL || "http://localhost:3000"}/visitor/login?token=${visitorToken}">Login to Visitor Portal</a></p>
       `,
       attachments: [
         {
@@ -899,19 +763,12 @@ exports.sendQR = async (req, res) => {
       ],
     };
 
-    console.log("📤 Sending email with PDF attachment...");
-    const info = await transporter.sendMail(mailOptions);
-    console.log("✅ Email sent successfully!");
-    console.log("📨 Message ID:", info.messageId);
+    await transporter.sendMail(mailOptions);
 
-    // Update visitor record
     visitor.lastQRSentAt = new Date();
     visitor.pdfSentAt = new Date();
     visitor.pdfDownloadCount = (visitor.pdfDownloadCount || 0) + 1;
     await visitor.save();
-    console.log(
-      "TRACE: [Backend Controller] Saved updated metadata to MongoDB visitor document.",
-    );
 
     res.status(200).json({
       success: true,
@@ -920,22 +777,13 @@ exports.sendQR = async (req, res) => {
         id: visitor._id,
         visitorName: visitor.visitorName,
         email: recipientEmail,
-        qrCode: visitor.qrCode,
-        qrToken: visitor.qrToken,
         expiresAt: visitor.qrExpiresAt,
         tempPassword: tempPassword,
         loginToken: visitorToken,
-        pdfSentAt: visitor.pdfSentAt,
-        pdfSize: `${(pdfBuffer.length / 1024).toFixed(2)} KB`,
-        messageId: info.messageId,
       },
     });
   } catch (error) {
-    console.error("❌ Error sending QR email:", error);
-    console.error(
-      "TRACE: [Backend Controller] Error stack details:",
-      error.stack,
-    );
+    console.error("Error sending QR email:", error);
     res.status(500).json({
       success: false,
       message: "Error sending QR code",
@@ -944,10 +792,7 @@ exports.sendQR = async (req, res) => {
   }
 };
 
-// ============================
-// RESEND QR VIA EMAIL
-// ============================
-
+// ===== RESEND QR VIA EMAIL =====
 exports.resendQR = async (req, res) => {
   try {
     const { id } = req.params;
@@ -984,7 +829,6 @@ exports.resendQR = async (req, res) => {
       });
     }
 
-    // Regenerate password if token is old or missing
     let tempPassword = null;
     let visitorToken = visitor.tempLoginToken;
 
@@ -1003,75 +847,13 @@ exports.resendQR = async (req, res) => {
       await visitor.save();
     }
 
-    // Generate PDF with LARGE QR code
-    console.log("📄 Generating PDF with large QR code...");
     const pdfBuffer = await generateVisitorPDF(visitor, visitor.qrCode);
-    console.log(
-      `✅ PDF generated successfully! Size: ${(pdfBuffer.length / 1024).toFixed(2)} KB`,
-    );
 
     const mailOptions = {
       from: `"Visitor Management System" <${process.env.SMTP_FROM || "sonutech04@gmail.com"}>`,
       to: recipientEmail,
       subject: `📄 Resent: Your Visitor Pass with QR Code - ${visitor.visitorName}`,
-      html: `
-        <!DOCTYPE html>
-        <html>
-        <head>
-          <style>
-            body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; max-width: 600px; margin: 0 auto; padding: 20px; }
-            .header { background: linear-gradient(135deg, #1a237e, #283593); color: white; padding: 25px; border-radius: 12px 12px 0 0; }
-            .content { background: #f5f5f5; padding: 30px; border-radius: 0 0 12px 12px; }
-            .warning { background: #fff3e0; padding: 15px; border-radius: 8px; border-left: 4px solid #e65100; margin: 20px 0; }
-            .button { display: inline-block; padding: 12px 30px; background: linear-gradient(135deg, #1a237e, #283593); color: white; text-decoration: none; border-radius: 6px; margin: 10px 0; }
-            .footer { margin-top: 20px; font-size: 12px; color: #888; text-align: center; border-top: 1px solid #ddd; padding-top: 20px; }
-            .qr-size-badge { display: inline-block; background: #e8f5e9; color: #2e7d32; padding: 4px 12px; border-radius: 12px; font-size: 12px; font-weight: bold; }
-          </style>
-        </head>
-        <body>
-          <div class="header">
-            <h1>📧 Visitor Pass Resent</h1>
-          </div>
-          <div class="content">
-            <h2>Hello ${visitor.visitorName},</h2>
-            <p>Your visitor pass has been resent with a <strong>large QR code</strong> attached as a PDF.</p>
-            
-            <div class="warning">
-              <p><strong>⚠️ Important:</strong> Your QR code expires on ${new Date(visitor.qrExpiresAt).toLocaleString()}</p>
-            </div>
-
-            <div style="background: white; padding: 15px; border-radius: 8px; margin: 20px 0;">
-              <p><strong>📎 PDF Attachment:</strong> Your visitor pass with <strong>large QR code (280px)</strong> is attached.</p>
-              <span class="qr-size-badge">📱 Large QR Code - Easy to Scan</span>
-            </div>
-
-            ${
-              tempPassword
-                ? `
-              <div style="background: #e8f5e9; padding: 20px; border-radius: 8px; border-left: 4px solid #2e7d32; margin: 20px 0;">
-                <h3>🔄 New Temporary Password</h3>
-                <p><strong>Password:</strong> <span style="font-size: 20px; background: #fff; padding: 8px 12px; border-radius: 4px; font-family: monospace; border: 2px dashed #2e7d32;">${tempPassword}</span></p>
-                <a href="${process.env.FRONTEND_URL || "http://localhost:3000"}/visitor/login?token=${visitorToken}" class="button">
-                  🔑 Login to Visitor Portal
-                </a>
-              </div>
-            `
-                : `
-              <p>You can continue using your existing login credentials.</p>
-              <a href="${process.env.FRONTEND_URL || "http://localhost:3000"}/visitor/login?token=${visitorToken}" class="button">
-                🔑 Login to Visitor Portal
-              </a>
-            `
-            }
-
-            <div class="footer">
-              <p>This is an automated message. Please do not reply to this email.</p>
-              <p>© ${new Date().getFullYear()} Visitor Management System</p>
-            </div>
-          </div>
-        </body>
-        </html>
-      `,
+      html: `<p>Your visitor pass has been resent.</p>`,
       attachments: [
         {
           filename: `visitor_pass_${visitor.visitorName.replace(/\s/g, "_")}.pdf`,
@@ -1081,9 +863,7 @@ exports.resendQR = async (req, res) => {
       ],
     };
 
-    console.log("📤 Resending email with PDF attachment...");
-    const info = await transporter.sendMail(mailOptions);
-    console.log("✅ Email resent successfully!");
+    await transporter.sendMail(mailOptions);
 
     visitor.lastQRSentAt = new Date();
     visitor.pdfSentAt = new Date();
@@ -1099,12 +879,10 @@ exports.resendQR = async (req, res) => {
         email: recipientEmail,
         expiresAt: visitor.qrExpiresAt,
         ...(tempPassword && { tempPassword }),
-        pdfSize: `${(pdfBuffer.length / 1024).toFixed(2)} KB`,
-        messageId: info.messageId,
       },
     });
   } catch (error) {
-    console.error("❌ Error resending QR:", error);
+    console.error("Error resending QR:", error);
     res.status(500).json({
       success: false,
       message: "Error resending QR code",
@@ -1113,10 +891,7 @@ exports.resendQR = async (req, res) => {
   }
 };
 
-// ============================
-// VISITOR LOGIN
-// ============================
-
+// ===== VISITOR LOGIN =====
 exports.visitorLogin = async (req, res) => {
   try {
     const { email, password } = req.body;
@@ -1136,15 +911,14 @@ exports.visitorLogin = async (req, res) => {
     if (!visitor) {
       return res.status(401).json({
         success: false,
-        message:
-          "Invalid credentials or QR expired. Please request a new QR code.",
+        message: "Invalid credentials or QR expired.",
       });
     }
 
     if (!visitor.tempPasswordHash) {
       return res.status(401).json({
         success: false,
-        message: "No login credentials found. Please request a new QR code.",
+        message: "No login credentials found.",
       });
     }
 
@@ -1155,7 +929,7 @@ exports.visitorLogin = async (req, res) => {
     if (!isValidPassword) {
       return res.status(401).json({
         success: false,
-        message: "Invalid password. Please check your temporary password.",
+        message: "Invalid password.",
       });
     }
 
@@ -1198,10 +972,7 @@ exports.visitorLogin = async (req, res) => {
   }
 };
 
-// ============================
-// GET VISITOR DASHBOARD
-// ============================
-
+// ===== GET VISITOR DASHBOARD =====
 exports.getVisitorDashboard = async (req, res) => {
   try {
     const visitorId = req.user?.visitorId || req.query.visitorId;
@@ -1251,10 +1022,7 @@ exports.getVisitorDashboard = async (req, res) => {
   }
 };
 
-// ============================
-// CHECK-IN VISITOR
-// ============================
-
+// ===== CHECK-IN VISITOR =====
 exports.checkInVisitor = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1286,7 +1054,7 @@ exports.checkInVisitor = async (req, res) => {
     if (visitor.isExpired()) {
       return res.status(400).json({
         success: false,
-        message: "QR code has expired. Please generate a new one.",
+        message: "QR code has expired.",
       });
     }
 
@@ -1321,10 +1089,7 @@ exports.checkInVisitor = async (req, res) => {
   }
 };
 
-// ============================
-// CHECK-OUT VISITOR
-// ============================
-
+// ===== CHECK-OUT VISITOR =====
 exports.checkOutVisitor = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1345,7 +1110,6 @@ exports.checkOutVisitor = async (req, res) => {
       });
     }
 
-    // Mark as checked out and free the ID Number
     visitor.checkedIn = false;
     visitor.idNumber = "";
     await visitor.save();
@@ -1369,10 +1133,7 @@ exports.checkOutVisitor = async (req, res) => {
   }
 };
 
-// ============================
-// REGENERATE QR
-// ============================
-
+// ===== REGENERATE QR =====
 exports.regenerateQR = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1433,10 +1194,7 @@ exports.regenerateQR = async (req, res) => {
   }
 };
 
-// ============================
-// DELETE VISITOR
-// ============================
-
+// ===== DELETE VISITOR =====
 exports.deleteVisitor = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1470,10 +1228,7 @@ exports.deleteVisitor = async (req, res) => {
   }
 };
 
-// ============================
-// BULK DELETE VISITORS
-// ============================
-
+// ===== BULK DELETE VISITORS =====
 exports.bulkDeleteVisitors = async (req, res) => {
   try {
     const { type = "expired" } = req.query;
@@ -1503,10 +1258,7 @@ exports.bulkDeleteVisitors = async (req, res) => {
   }
 };
 
-// ============================
-// SCAN QR
-// ============================
-
+// ===== SCAN QR =====
 exports.scanVisitorQR = async (req, res) => {
   try {
     const token =
@@ -1559,10 +1311,7 @@ exports.scanVisitorQR = async (req, res) => {
   }
 };
 
-// ============================
-// VALIDATE QR
-// ============================
-
+// ===== VALIDATE QR =====
 exports.validateQR = async (req, res) => {
   try {
     const { token } = req.params;
@@ -1597,21 +1346,8 @@ exports.validateQR = async (req, res) => {
   }
 };
 
-// ============================
-// SCAN QR & GET COMPANY CABINETS
-// ============================
-
+// ===== SCAN QR & GET COMPANY CABINETS =====
 exports.scanAndGetCabinets = async (req, res) => {
-  console.log("==========================================");
-  console.log(
-    "🚀 [scanAndGetCabinets] Incoming request:",
-    req.method,
-    req.originalUrl,
-  );
-  console.log("📥 [scanAndGetCabinets] req.params:", req.params);
-  console.log("📥 [scanAndGetCabinets] req.body:", req.body);
-  console.log("📥 [scanAndGetCabinets] req.query:", req.query);
-
   try {
     const token =
       req.params?.token ||
@@ -1619,28 +1355,16 @@ exports.scanAndGetCabinets = async (req, res) => {
       req.body?.qrToken ||
       req.query?.token;
 
-    console.log("🔑 [scanAndGetCabinets] Extracted Token:", token);
-
     if (!token) {
-      console.log(
-        "❌ [scanAndGetCabinets] Validation failed: No token provided in params, body, or query",
-      );
       return res.status(400).json({
         success: false,
         message: "QR token is required",
       });
     }
 
-    // 1. Validate QR token & get visitor profile
-    console.log(
-      "⏳ [scanAndGetCabinets] Step 1: Validating token against database...",
-    );
     const visitor = await findValidVisitorByToken(token);
 
     if (!visitor) {
-      console.log(
-        "❌ [scanAndGetCabinets] Step 1 Failed: Token is invalid or expired. Returning 404.",
-      );
       return res.status(404).json({
         success: false,
         message: "QR code is invalid or expired",
@@ -1648,37 +1372,23 @@ exports.scanAndGetCabinets = async (req, res) => {
       });
     }
 
-    console.log(
-      "✅ [scanAndGetCabinets] Step 1 Success: Visitor verified - ID:",
-      visitor._id,
-      "Name:",
-      visitor.visitorName,
-      "Company:",
-      visitor.company,
-    );
-
-    // 2. Fetch available cabinets for the visitor's registered company
     const companyName = visitor.company ? visitor.company.trim() : "";
-    console.log(
-      "⏳ [scanAndGetCabinets] Step 2: Fetching cabinets for company:",
-      companyName || "(No company set)",
-    );
     let cabinets = [];
 
     if (companyName) {
-      const escapedCompany = companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       cabinets = await Cabinet.find({
-        companyName: { $regex: new RegExp(`^${escapedCompany}$`, "i") },
+        companyName: {
+          $regex: new RegExp(
+            `^${companyName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`,
+            "i",
+          ),
+        },
         isActive: true,
       })
         .sort({ cabinetName: 1 })
         .lean();
 
       if (cabinets.length === 0) {
-        console.log(
-          "ℹ️ [scanAndGetCabinets] Exact match found 0 cabinets, trying partial regex search for:",
-          companyName,
-        );
         cabinets = await Cabinet.find({
           companyName: { $regex: companyName, $options: "i" },
           isActive: true,
@@ -1688,24 +1398,12 @@ exports.scanAndGetCabinets = async (req, res) => {
       }
     }
 
-    console.log(
-      "✅ [scanAndGetCabinets] Step 2 Success: Found",
-      cabinets.length,
-      "cabinets for company",
-    );
-
-    // 3. Common areas (matching the UI design)
     const commonAreas = [
       { id: "wash_room", name: "Wash Room", type: "Common" },
       { id: "key_cabinet", name: "Key Cabinet", type: "Common" },
       { id: "noc_room", name: "NOC Room", type: "Common" },
       { id: "loading_area", name: "Loading Area", type: "Common" },
     ];
-
-    console.log(
-      "✅ [scanAndGetCabinets] Step 3: Returning success response with visitor details & cabinets",
-    );
-    console.log("==========================================");
 
     res.status(200).json({
       success: true,
@@ -1733,10 +1431,7 @@ exports.scanAndGetCabinets = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error(
-      "💥 [scanAndGetCabinets] Error scanning QR for cabinets:",
-      error,
-    );
+    console.error("Error scanning QR for cabinets:", error);
     res.status(500).json({
       success: false,
       message: "Error scanning QR and fetching cabinets",
@@ -1745,10 +1440,7 @@ exports.scanAndGetCabinets = async (req, res) => {
   }
 };
 
-// ============================
-// GET VISITOR LOCATION
-// ============================
-
+// ===== GET VISITOR LOCATION =====
 exports.getVisitorLocation = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1769,7 +1461,6 @@ exports.getVisitorLocation = async (req, res) => {
       });
     }
 
-    // Check if visitor has an assigned cabinet/ID
     if (!visitor.idNumber || visitor.idNumber.trim() === "") {
       return res.status(404).json({
         success: false,
@@ -1777,13 +1468,15 @@ exports.getVisitorLocation = async (req, res) => {
       });
     }
 
-    // Fetch all asset locations from Mist
     const assets = await fetchAssetLocations();
 
-    // Find the asset that matches the visitor's ID Number
     const matchedAsset = assets.find(
       (asset) =>
-        asset.name === visitor.idNumber || asset.mac === visitor.idNumber,
+        asset.name === visitor.idNumber ||
+        asset.mac === visitor.idNumber ||
+        (asset.raw &&
+          (asset.raw.name === visitor.idNumber ||
+            asset.raw.mac === visitor.idNumber)),
     );
 
     if (!matchedAsset) {
@@ -1793,24 +1486,17 @@ exports.getVisitorLocation = async (req, res) => {
       });
     }
 
-    // Get map details if map_id exists
-    let mapDetails = null;
-    if (matchedAsset.map_id) {
-      mapDetails = await fetchMapDetails(matchedAsset.map_id);
-    }
+    const rawData = matchedAsset.raw || matchedAsset;
 
-    // Calculate distance from target coordinates (if provided)
     const targetX = 5525.298750495607;
     const targetY = 2491.837930104785;
     const distance =
-      matchedAsset.x && matchedAsset.y
+      rawData.x && rawData.y
         ? Math.sqrt(
-            Math.pow(matchedAsset.x - targetX, 2) +
-              Math.pow(matchedAsset.y - targetY, 2),
+            Math.pow(rawData.x - targetX, 2) + Math.pow(rawData.y - targetY, 2),
           )
         : null;
 
-    // Determine proximity status
     const proximityStatus =
       distance !== null
         ? distance < 100
@@ -1821,6 +1507,11 @@ exports.getVisitorLocation = async (req, res) => {
               ? "Moderate"
               : "Far"
         : "Unknown";
+
+    const stability = matchedAsset.stability || 1.0;
+    const isStable = stability > 0.7;
+    const beamAngle =
+      rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
 
     const locationData = {
       visitor: {
@@ -1836,35 +1527,37 @@ exports.getVisitorLocation = async (req, res) => {
         qrExpiresAt: visitor.qrExpiresAt,
       },
       location: {
-        x: matchedAsset.x || null,
-        y: matchedAsset.y || null,
-        name: matchedAsset.name,
-        mac: matchedAsset.mac,
-        map_id: matchedAsset.map_id,
-        ap_mac: matchedAsset.ap_mac,
-        last_seen: matchedAsset.last_seen,
-        rssi: matchedAsset.rssi,
-        beam: matchedAsset.beam,
-        device_name: matchedAsset.device_name,
-        manufacture: matchedAsset.manufacture,
+        x: rawData.x || null,
+        y: rawData.y || null,
+        name: rawData.name || matchedAsset.device_name,
+        mac: rawData.mac,
+        map_id: rawData.map_id,
+        ap_mac: rawData.ap_mac,
+        last_seen: rawData.last_seen,
+        rssi: rawData.rssi,
+        beam: rawData.beam,
+        beam_angle: beamAngle,
+        device_name: rawData.device_name,
+        manufacture: rawData.manufacture,
+        stability: stability,
+        is_stable: isStable,
+        smoothed_position: matchedAsset.position || null,
+        ap_history: matchedAsset.apHistory || [],
       },
-      map: mapDetails
-        ? {
-            id: mapDetails.id,
-            name: mapDetails.name,
-            width: mapDetails.width,
-            height: mapDetails.height,
-            orientation: mapDetails.orientation,
-          }
-        : null,
-      target_coordinates: {
-        x: targetX,
-        y: targetY,
-      },
+      target_coordinates: { x: targetX, y: targetY },
       distance: distance,
       proximity: proximityStatus,
       timestamp: new Date().toISOString(),
     };
+
+    if (rawData.map_id) {
+      const worldCoords = convertMistToWorld(
+        rawData.x,
+        rawData.y,
+        rawData.map_id,
+      );
+      locationData.location.world_coordinates = worldCoords;
+    }
 
     res.status(200).json({
       success: true,
@@ -1881,76 +1574,7 @@ exports.getVisitorLocation = async (req, res) => {
   }
 };
 
-// ============================
-// GET ALL ASSET LOCATIONS
-// ============================
-
-exports.getAllAssetLocations = async (req, res) => {
-  try {
-    const assets = await fetchAssetLocations();
-
-    // Filter assets with location data
-    const locatedAssets = assets.filter(
-      (asset) => asset.x !== undefined && asset.x !== null,
-    );
-
-    res.status(200).json({
-      success: true,
-      total: locatedAssets.length,
-      data: locatedAssets,
-    });
-  } catch (error) {
-    console.error("Error fetching asset locations:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching asset locations",
-      error: error.message,
-    });
-  }
-};
-
-// ============================
-// GET MAP DETAILS
-// ============================
-
-exports.getMapDetails = async (req, res) => {
-  try {
-    const { mapId } = req.params;
-
-    if (!mapId) {
-      return res.status(400).json({
-        success: false,
-        message: "Map ID is required",
-      });
-    }
-
-    const mapDetails = await fetchMapDetails(mapId);
-
-    if (!mapDetails) {
-      return res.status(404).json({
-        success: false,
-        message: "Map not found",
-      });
-    }
-
-    res.status(200).json({
-      success: true,
-      data: mapDetails,
-    });
-  } catch (error) {
-    console.error("Error fetching map details:", error);
-    res.status(500).json({
-      success: false,
-      message: "Error fetching map details",
-      error: error.message,
-    });
-  }
-};
-
-// ============================
-// GET VISITOR CABINET
-// ============================
-
+// ===== GET VISITOR CABINET =====
 exports.getVisitorCabinet = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1978,10 +1602,8 @@ exports.getVisitorCabinet = async (req, res) => {
       });
     }
 
-    // Fetch all assets from Mist
     const assets = await fetchAssetLocations();
 
-    // Find the asset by name or MAC
     const cabinet = assets.find(
       (asset) =>
         asset.name === visitor.idNumber || asset.mac === visitor.idNumber,
@@ -1992,12 +1614,6 @@ exports.getVisitorCabinet = async (req, res) => {
         success: false,
         message: "Cabinet/asset not found in system",
       });
-    }
-
-    // Get map details
-    let mapDetails = null;
-    if (cabinet.map_id) {
-      mapDetails = await fetchMapDetails(cabinet.map_id);
     }
 
     res.status(200).json({
@@ -2019,14 +1635,6 @@ exports.getVisitorCabinet = async (req, res) => {
           rssi: cabinet.rssi,
           device_name: cabinet.device_name,
         },
-        map: mapDetails
-          ? {
-              id: mapDetails.id,
-              name: mapDetails.name,
-              width: mapDetails.width,
-              height: mapDetails.height,
-            }
-          : null,
       },
     });
   } catch (error) {
@@ -2039,10 +1647,7 @@ exports.getVisitorCabinet = async (req, res) => {
   }
 };
 
-// ============================
-// UPDATE VISITOR CABINET
-// ============================
-
+// ===== UPDATE VISITOR CABINET =====
 exports.updateVisitorCabinet = async (req, res) => {
   try {
     const { id } = req.params;
@@ -2071,7 +1676,6 @@ exports.updateVisitorCabinet = async (req, res) => {
       });
     }
 
-    // Update visitor's idNumber
     visitor.idNumber = idNumber || assetName;
     await visitor.save();
 
@@ -2089,6 +1693,152 @@ exports.updateVisitorCabinet = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Error updating visitor cabinet",
+      error: error.message,
+    });
+  }
+};
+
+// ===== GET ALL ASSET LOCATIONS =====
+exports.getAllAssetLocations = async (req, res) => {
+  try {
+    const assets = await fetchAssetLocations();
+
+    const formattedAssets = assets.map((asset) => {
+      const rawData = asset.raw || asset;
+      return {
+        ...asset,
+        raw: {
+          x: rawData.x,
+          y: rawData.y,
+          name: rawData.name,
+          mac: rawData.mac,
+          map_id: rawData.map_id,
+          ap_mac: rawData.ap_mac,
+          rssi: rawData.rssi,
+          beam: rawData.beam,
+          beam_angle:
+            rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null,
+          last_seen: rawData.last_seen,
+          device_name: rawData.device_name,
+          manufacture: rawData.manufacture,
+        },
+        stability: asset.stability || 1.0,
+        is_stable: (asset.stability || 1.0) > 0.7,
+        ap_history: asset.apHistory || [],
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      total: formattedAssets.length,
+      data: formattedAssets,
+    });
+  } catch (error) {
+    console.error("Error fetching asset locations:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching asset locations",
+      error: error.message,
+    });
+  }
+};
+
+// ===== GET MAP DETAILS =====
+exports.getMapDetails = async (req, res) => {
+  try {
+    const { mapId } = req.params;
+
+    if (!mapId) {
+      return res.status(400).json({
+        success: false,
+        message: "Map ID is required",
+      });
+    }
+
+    const mapDetails = await fetchMapDetails(mapId);
+
+    if (!mapDetails) {
+      return res.status(404).json({
+        success: false,
+        message: "Map not found",
+      });
+    }
+
+    const mapConfig = MAP_CONFIGS[mapId];
+
+    res.status(200).json({
+      success: true,
+      data: {
+        ...mapDetails,
+        config: mapConfig || null,
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching map details:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching map details",
+      error: error.message,
+    });
+  }
+};
+
+// ===== GET ASSET TRACKING STATE =====
+exports.getAssetTrackingState = async (req, res) => {
+  try {
+    const states = AssetTracker.getAssetStates();
+
+    const formattedStates = {};
+    for (const [mac, state] of Object.entries(states)) {
+      formattedStates[mac] = {
+        device_name: state.device_name,
+        position: state.position,
+        stability: state.stability,
+        is_stable: state.stability > 0.7,
+        lastUpdate: state.lastUpdate,
+        lastUpdateFormatted: new Date(state.lastUpdate).toISOString(),
+        apHistory: state.apHistory || [],
+      };
+    }
+
+    res.status(200).json({
+      success: true,
+      total: Object.keys(formattedStates).length,
+      data: formattedStates,
+    });
+  } catch (error) {
+    console.error("Error fetching tracking state:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching tracking state",
+      error: error.message,
+    });
+  }
+};
+
+// ===== RESET ASSET TRACKING =====
+exports.resetAssetTracking = async (req, res) => {
+  try {
+    const { mac } = req.params;
+
+    if (!mac) {
+      return res.status(400).json({
+        success: false,
+        message: "Asset MAC address is required",
+      });
+    }
+
+    AssetTracker.resetAsset(mac);
+
+    res.status(200).json({
+      success: true,
+      message: `Asset tracking reset for ${mac}`,
+    });
+  } catch (error) {
+    console.error("Error resetting tracking:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error resetting tracking",
       error: error.message,
     });
   }

@@ -1,4 +1,4 @@
-// routes/visitorRoutes.js
+// routes/IDVisitor.routes.js
 const express = require("express");
 const router = express.Router();
 const visitorController = require("../controllers/IDVIsitorQR.Controller");
@@ -74,25 +74,39 @@ router.post("/visitors/:id/regenerate-qr", visitorController.regenerateQR);
 // LOCATION TRACKING ROUTES
 // ============================
 
-// Get visitor location with optional wayfinding path
-// Query params: ?includePath=true|false (default: true)
-router.get("/visitors/:id/location", locationController.getVisitorRoute);
+// Get visitor location
+router.get("/visitors/:id/location", visitorController.getVisitorLocation);
+
+// Get visitor navigation with wayfinding
+router.get("/visitors/:id/navigation", visitorController.getVisitorLocation);
 
 // Get visitor cabinet/asset
-router.get("/visitors/:id/cabinet", locationController.getVisitorCabinet);
+router.get("/visitors/:id/cabinet", visitorController.getVisitorCabinet);
 
 // Update visitor cabinet
-router.put("/visitors/:id/cabinet", locationController.updateVisitorCabinet);
+router.put("/visitors/:id/cabinet", visitorController.updateVisitorCabinet);
 
 // Get all asset locations from Mist
-router.get("/assets/locations", locationController.getAllAssetLocations);
+router.get("/assets/locations", visitorController.getAllAssetLocations);
 
-// Get map details
-router.get("/maps/:mapId", locationController.getMapDetails);
+// Get asset tracking state
+router.get("/assets/tracking/state", visitorController.getAssetTrackingState);
+
+// Reset asset tracking
+router.delete(
+  "/assets/tracking/reset/:mac",
+  visitorController.resetAssetTracking,
+);
 
 // ============================
-// NEW: WAYFINDING & NAVIGATION ROUTES
+// MAP & WAYFINDING ROUTES (NEW)
 // ============================
+
+/**
+ * Get map details
+ * GET /api/IDVisitor/maps/:mapId
+ */
+router.get("/maps/:mapId", visitorController.getMapDetails);
 
 /**
  * Get wayfinding path for a specific map
@@ -102,15 +116,18 @@ router.get("/maps/:mapId", locationController.getMapDetails);
  *   success: true,
  *   data: {
  *     nodes: [...],
- *     edges: {...}
+ *     edges: {...},
+ *     map: {...},
+ *     total_nodes: number,
+ *     total_edges: number
  *   }
  * }
  */
 router.get("/maps/:mapId/wayfinding", locationController.getWayfindingPath);
 
 /**
- * Get navigation route between two points on a map
- * GET /api/IDVisitor/maps/:mapId/route?fromX=&fromY=&toX=&toY=
+ * Get navigation route between two points
+ * GET /api/IDVisitor/maps/:mapId/route
  *
  * Query params:
  * - fromX: number (start X coordinate in pixels)
@@ -118,37 +135,22 @@ router.get("/maps/:mapId/wayfinding", locationController.getWayfindingPath);
  * - toX: number (end X coordinate in pixels)
  * - toY: number (end Y coordinate in pixels)
  *
- * Response: {
- *   success: true,
- *   data: {
- *     start: {...},
- *     end: {...},
- *     route: {
- *       path: [...nodeNames],
- *       nodes: [...nodeObjects],
- *       segments: number
- *     },
- *     wayfinding_path: {...} // full path for rendering
- *   }
- * }
- *
- * Example: /api/IDVisitor/maps/123/route?fromX=100&fromY=200&toX=500&toY=600
+ * Example: /maps/123/route?fromX=100&fromY=200&toX=500&toY=600
  */
 router.get("/maps/:mapId/route", locationController.getNavigationRoute);
 
 /**
- * Get detailed visitor location with full wayfinding data
- * Alternative endpoint for mobile apps that need complete path data
- * GET /api/IDVisitor/visitors/:id/navigation
+ * Test coordinate conversion
+ * GET /api/IDVisitor/maps/:mapId/convert
  *
- * This returns the same as /location but with more detailed wayfinding info
+ * Query params: ?x=6140&y=1369
  */
-router.get("/visitors/:id/navigation", locationController.getVisitorRoute);
+router.get("/maps/:mapId/convert", locationController.testCoordinateConversion);
 
 // ============================
 // DELETE OPERATIONS
 // ============================
-router.get("/maps/:mapId/convert", locationController.testCoordinateConversion);
+
 // Delete single visitor
 router.delete("/visitors/:id", visitorController.deleteVisitor);
 
