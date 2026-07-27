@@ -71,79 +71,58 @@ router.post("/visitors/:id/check-out", visitorController.checkOutVisitor);
 router.post("/visitors/:id/regenerate-qr", visitorController.regenerateQR);
 
 // ============================
-// LOCATION TRACKING ROUTES
+// LOCATION TRACKING ROUTES (UPDATED)
 // ============================
 
-// Get visitor location
-router.get("/visitors/:id/location", visitorController.getVisitorLocation);
+// Get visitor location - NOW USING locationController
+router.get("/visitors/:id/location", locationController.getVisitorRoute);
 
 // Get visitor navigation with wayfinding
-router.get("/visitors/:id/navigation", visitorController.getVisitorLocation);
+router.get("/visitors/:id/navigation", locationController.getVisitorRoute);
 
 // Get visitor cabinet/asset
-router.get("/visitors/:id/cabinet", visitorController.getVisitorCabinet);
+router.get("/visitors/:id/cabinet", locationController.getVisitorCabinet);
 
 // Update visitor cabinet
-router.put("/visitors/:id/cabinet", visitorController.updateVisitorCabinet);
+router.put("/visitors/:id/cabinet", locationController.updateVisitorCabinet);
 
 // Get all asset locations from Mist
-router.get("/assets/locations", visitorController.getAllAssetLocations);
+router.get("/assets/locations", locationController.getAllAssetLocations);
 
 // Get asset tracking state
-router.get("/assets/tracking/state", visitorController.getAssetTrackingState);
+router.get("/assets/tracking/state", locationController.getAssetTrackingState);
 
 // Reset asset tracking
 router.delete(
   "/assets/tracking/reset/:mac",
-  visitorController.resetAssetTracking,
+  locationController.resetAssetTracking,
 );
 
 // ============================
-// MAP & WAYFINDING ROUTES (NEW)
+// MAP & WAYFINDING ROUTES
 // ============================
 
 /**
  * Get map details
  * GET /api/IDVisitor/maps/:mapId
  */
-router.get("/maps/:mapId", visitorController.getMapDetails);
+router.get("/maps/:mapId", locationController.getMapDetails);
 
 /**
  * Get wayfinding path for a specific map
  * GET /api/IDVisitor/maps/:mapId/wayfinding
- *
- * Response: {
- *   success: true,
- *   data: {
- *     nodes: [...],
- *     edges: {...},
- *     map: {...},
- *     total_nodes: number,
- *     total_edges: number
- *   }
- * }
  */
 router.get("/maps/:mapId/wayfinding", locationController.getWayfindingPath);
 
 /**
  * Get navigation route between two points
  * GET /api/IDVisitor/maps/:mapId/route
- *
- * Query params:
- * - fromX: number (start X coordinate in pixels)
- * - fromY: number (start Y coordinate in pixels)
- * - toX: number (end X coordinate in pixels)
- * - toY: number (end Y coordinate in pixels)
- *
- * Example: /maps/123/route?fromX=100&fromY=200&toX=500&toY=600
  */
 router.get("/maps/:mapId/route", locationController.getNavigationRoute);
 
 /**
  * Test coordinate conversion
  * GET /api/IDVisitor/maps/:mapId/convert
- *
- * Query params: ?x=6140&y=1369
  */
 router.get("/maps/:mapId/convert", locationController.testCoordinateConversion);
 

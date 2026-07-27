@@ -54,10 +54,10 @@ class AssetTracker extends EventEmitter {
     super();
     this.assetStates = new Map();
     this.filterWindows = new Map();
-    this.bestLocationCache = new Map(); // Store best location per asset
+    this.bestLocationCache = new Map();
     this.WINDOW_SIZE = 5;
     this.STABILITY_THRESHOLD = 2.0;
-    this.LOWEST_RSSI_THRESHOLD = -60; // RSSI below this is considered good
+    this.LOWEST_RSSI_THRESHOLD = -60;
   }
 
   async getAssets() {
@@ -88,15 +88,12 @@ class AssetTracker extends EventEmitter {
 
     for (const [mac, detections] of assetGroups) {
       try {
-        // STEP 1: Find the detection with the LOWEST RSSI (most accurate)
         const bestDetection = this.selectBestAP(detections, mac);
 
         if (!bestDetection) continue;
 
-        // STEP 2: Check if this is the most accurate location so far
         const isMostAccurate = this.isMostAccurateLocation(bestDetection, mac);
 
-        // STEP 3: Get or create asset state
         let assetState = this.assetStates.get(mac);
         if (!assetState) {
           assetState = {
@@ -104,8 +101,8 @@ class AssetTracker extends EventEmitter {
             device_name: bestDetection.device_name,
             map_id: bestDetection.map_id,
             currentPosition: null,
-            bestPosition: null, // Store the best (most accurate) position
-            bestRSSI: Infinity, // Track the best RSSI seen
+            bestPosition: null,
+            bestRSSI: Infinity,
             lastUpdate: Date.now(),
             apHistory: [],
             stabilityScore: 1.0,
@@ -114,14 +111,12 @@ class AssetTracker extends EventEmitter {
           this.assetStates.set(mac, assetState);
         }
 
-        // STEP 4: Convert coordinates
         const convertedCoords = this.convertCoordinates(
           bestDetection.x,
           bestDetection.y,
           bestDetection.map_id,
         );
 
-        // STEP 5: Update best position if this is more accurate
         if (isMostAccurate) {
           assetState.bestPosition = convertedCoords;
           assetState.bestRSSI = bestDetection.rssi;
@@ -131,7 +126,6 @@ class AssetTracker extends EventEmitter {
           );
         }
 
-        // STEP 6: Smooth the position using weighted average
         const smoothedPosition = this.smoothPosition(
           convertedCoords,
           bestDetection.rssi,
@@ -140,7 +134,6 @@ class AssetTracker extends EventEmitter {
           bestDetection.beam,
         );
 
-        // STEP 7: Use the BEST position if available and stable
         if (assetState.bestPosition && assetState.positionStable) {
           assetState.currentPosition = assetState.bestPosition;
         } else {
@@ -162,7 +155,6 @@ class AssetTracker extends EventEmitter {
 
         assetState.stabilityScore = this.calculateStability(assetState);
 
-        // Emit event
         this.emit("assetUpdate", {
           mac,
           device_name: assetState.device_name,
@@ -174,6 +166,7 @@ class AssetTracker extends EventEmitter {
           timestamp: Date.now(),
         });
 
+        // ============ ADD PPM TO OUTPUT ============
         processedAssets.push({
           mac,
           device_name: assetState.device_name,
@@ -187,6 +180,9 @@ class AssetTracker extends EventEmitter {
           apHistory: assetState.apHistory.slice(-3),
           is_most_accurate: isMostAccurate,
           best_rssi: assetState.bestRSSI,
+          ppm: assetState.bestPosition
+            ? assetState.bestPosition.ppm
+            : 50.07391564392213, // ✅ ADDED
         });
       } catch (error) {
         console.error(`Error processing asset ${mac}:`, error);
@@ -197,27 +193,21 @@ class AssetTracker extends EventEmitter {
     return processedAssets;
   }
 
-  // NEW: Check if this detection is the most accurate (lowest RSSI)
   isMostAccurateLocation(detection, mac) {
     const assetState = this.assetStates.get(mac);
 
-    // If no previous state, this is the most accurate
     if (!assetState) {
       return true;
     }
 
-    // If RSSI is lower (better signal) than previous best, update
     if (detection.rssi < assetState.bestRSSI) {
       return true;
     }
 
-    // If RSSI is within 2 dBm of best, keep it stable
     if (Math.abs(detection.rssi - assetState.bestRSSI) <= 2) {
-      // Keep the existing best position to avoid jumping
       return false;
     }
 
-    // If signal got worse, don't update
     return false;
   }
 
@@ -251,17 +241,13 @@ class AssetTracker extends EventEmitter {
     const scoredDetections = detections.map((detection) => {
       let score = 0;
 
-      // 1. RSSI Score (LOWER RSSI = HIGHER SCORE - More accurate)
-      // RSSI range: -30 to -100, we want closer to -30
-      const rssiScore = Math.max(0, (detection.rssi + 100) / 70); // -30 = 1, -100 = 0
-      score += rssiScore * 0.5; // 50% weight - MOST IMPORTANT
+      const rssiScore = Math.max(0, (detection.rssi + 100) / 70);
+      score += rssiScore * 0.5;
 
-      // 2. AP Stability Score (prefer consistent AP)
       if (detection.ap_mac === previousAP) {
         score += 0.2;
       }
 
-      // 3. Position Continuity Score
       if (previousPosition) {
         const convertedCoords = this.convertCoordinates(
           detection.x,
@@ -283,7 +269,6 @@ class AssetTracker extends EventEmitter {
         score += continuityScore;
       }
 
-      // 4. Beam Direction Score
       if (previousPosition && detection.beam !== undefined) {
         const beamAngle = BEAM_ANGLES[detection.beam] || 0;
         const apLocation = this.convertCoordinates(
@@ -311,7 +296,6 @@ class AssetTracker extends EventEmitter {
       return { detection, score };
     });
 
-    // Sort by score descending (highest = best)
     scoredDetections.sort((a, b) => b.score - a.score);
 
     const best = scoredDetections[0].detection;
@@ -364,19 +348,13 @@ class AssetTracker extends EventEmitter {
       return coords;
     }
 
-    // Weighted average - give MORE weight to lower RSSI readings
     let totalWeight = 0;
     let weightedX = 0;
     let weightedY = 0;
 
     const weights = window.map((sample) => {
-      // RSSI weight: lower RSSI = higher weight (signal is stronger)
       const rssiWeight = Math.max(0.1, (sample.rssi + 100) / 40);
-
-      // Recency weight: newer = higher
       const recencyWeight = 0.3;
-
-      // Combined: 70% RSSI, 30% recency
       return rssiWeight * 0.7 + recencyWeight * 0.3;
     });
 
@@ -394,7 +372,6 @@ class AssetTracker extends EventEmitter {
     const smoothedX = weightedX / totalWeight;
     const smoothedY = weightedY / totalWeight;
 
-    // Check for large jumps
     const lastPosition = window[window.length - 2];
     if (lastPosition) {
       const distance = this.calculateDistance(
@@ -404,7 +381,6 @@ class AssetTracker extends EventEmitter {
         smoothedY,
       );
 
-      // If jump is too large, use the best position if available
       if (distance > this.STABILITY_THRESHOLD) {
         const assetState = this.assetStates.get(mac);
         if (assetState && assetState.bestPosition) {
@@ -414,7 +390,6 @@ class AssetTracker extends EventEmitter {
           return assetState.bestPosition;
         }
 
-        // Otherwise, blend with previous
         const blendedX = (lastPosition.coords.x_m + smoothedX) / 2;
         const blendedY = (lastPosition.coords.y_m + smoothedY) / 2;
         return { x_m: blendedX, y_m: blendedY };
@@ -433,7 +408,6 @@ class AssetTracker extends EventEmitter {
       return 1.0;
     }
 
-    // Check if we have a stable best position
     if (assetState.positionStable && assetState.bestPosition) {
       return 1.0;
     }

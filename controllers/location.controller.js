@@ -347,6 +347,274 @@ const convertWayfindingNodes = (nodes, mapData) => {
 // GET VISITOR LOCATION WITH ROUTE (ENHANCED)
 // ============================
 
+// exports.getVisitorRoute = async (req, res) => {
+//   try {
+//     const { id } = req.params;
+//     const { includePath = "true" } = req.query;
+
+//     console.log("📍 Fetching location for visitor ID:", id);
+
+//     if (!mongoose.Types.ObjectId.isValid(id)) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Invalid visitor ID format",
+//       });
+//     }
+
+//     const visitor = await QRModel.findById(id);
+
+//     if (!visitor) {
+//       return res.status(404).json({
+//         success: false,
+//         message: "Visitor not found",
+//       });
+//     }
+
+//     console.log("👤 Visitor found:", visitor.visitorName);
+//     console.log("🆔 ID Number:", visitor.idNumber || "(empty)");
+
+//     if (!visitor.idNumber || visitor.idNumber.trim() === "") {
+//       return res.status(404).json({
+//         success: false,
+//         message: "No ID/asset assigned to this visitor.",
+//         suggestion:
+//           "Use PUT /api/IDVisitor/visitors/:id/cabinet with { 'idNumber': 'Tag1' }",
+//         visitor: {
+//           id: visitor._id,
+//           name: visitor.visitorName,
+//           company: visitor.company,
+//           currentIdNumber: visitor.idNumber || "Not assigned",
+//         },
+//       });
+//     }
+
+//     console.log("📡 Fetching asset locations from Mist API...");
+//     let assets;
+//     try {
+//       assets = await fetchAssetLocations();
+//     } catch (error) {
+//       console.error("❌ Mist API Error:", error.message);
+//       return res.status(500).json({
+//         success: false,
+//         message: "Failed to fetch asset locations from Mist API",
+//         error: error.message,
+//       });
+//     }
+
+//     const assetNames = assets
+//       .map((a) => a.raw?.name || a.name)
+//       .filter((name) => name);
+//     console.log("📋 Available assets:", assetNames.join(", "));
+
+//     // Find matched asset with enhanced data
+//     const matchedAsset = assets.find((asset) => {
+//       const rawData = asset.raw || asset;
+//       return (
+//         rawData.name === visitor.idNumber || rawData.mac === visitor.idNumber
+//       );
+//     });
+
+//     if (!matchedAsset) {
+//       return res.status(404).json({
+//         success: false,
+//         message: `Asset "${visitor.idNumber}" not found in Mist system`,
+//         available_assets: assetNames,
+//         suggestion:
+//           "Make sure the idNumber matches an asset name in Mist. Available assets: " +
+//           assetNames.join(", "),
+//       });
+//     }
+
+//     const rawData = matchedAsset.raw || matchedAsset;
+
+//     console.log("✅ Asset found:", rawData.name);
+
+//     if (!rawData.x || !rawData.y) {
+//       return res.status(404).json({
+//         success: false,
+//         message: `Asset "${rawData.name}" found but has no location data`,
+//         data: {
+//           name: rawData.name,
+//           mac: rawData.mac,
+//           last_seen: rawData.last_seen,
+//           has_location: false,
+//         },
+//       });
+//     }
+
+//     let mapDetails = null;
+//     let wayfindingPath = null;
+//     let nearestNode = null;
+//     let routeToDestination = null;
+
+//     if (rawData.map_id) {
+//       try {
+//         mapDetails = await fetchMapDetails(rawData.map_id);
+
+//         if (includePath === "true") {
+//           wayfindingPath = await fetchWayfindingPath(rawData.map_id);
+
+//           if (
+//             wayfindingPath &&
+//             wayfindingPath.nodes &&
+//             wayfindingPath.nodes.length > 0
+//           ) {
+//             const targetX = 5525.298750495607;
+//             const targetY = 2491.837930104785;
+
+//             nearestNode = findNearestNode(wayfindingPath, rawData.x, rawData.y);
+//             const destNode = findNearestNode(wayfindingPath, targetX, targetY);
+
+//             if (nearestNode && nearestNode.node && destNode && destNode.node) {
+//               routeToDestination = findRoute(
+//                 wayfindingPath,
+//                 nearestNode.node.name,
+//                 destNode.node.name,
+//               );
+//             }
+//           }
+//         }
+//       } catch (error) {
+//         console.warn("⚠️ Could not fetch wayfinding data:", error.message);
+//       }
+//     }
+
+//     const targetX = 5525.298750495607;
+//     const targetY = 2491.837930104785;
+
+//     const distance =
+//       rawData.x && rawData.y
+//         ? Math.sqrt(
+//             Math.pow(rawData.x - targetX, 2) + Math.pow(rawData.y - targetY, 2),
+//           )
+//         : null;
+
+//     const proximityStatus =
+//       distance !== null
+//         ? distance < 100
+//           ? "Very Close"
+//           : distance < 300
+//             ? "Close"
+//             : distance < 500
+//               ? "Moderate"
+//               : "Far"
+//         : "Unknown";
+
+//     // Get enhanced tracking data
+//     const stability = matchedAsset.stability || 1.0;
+//     const isStable = stability > 0.7;
+//     const beamAngle =
+//       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
+
+//     const locationData = {
+//       visitor: {
+//         id: visitor._id,
+//         name: visitor.visitorName,
+//         phone: visitor.phoneNumber,
+//         email: visitor.email,
+//         company: visitor.company,
+//         idNumber: visitor.idNumber,
+//         purpose: visitor.purpose,
+//         checkedIn: visitor.checkedIn,
+//         checkedInAt: visitor.checkedInAt,
+//         qrExpiresAt: visitor.qrExpiresAt,
+//       },
+//       location: {
+//         x: rawData.x,
+//         y: rawData.y,
+//         name: rawData.name,
+//         mac: rawData.mac,
+//         map_id: rawData.map_id,
+//         ap_mac: rawData.ap_mac,
+//         last_seen: rawData.last_seen,
+//         rssi: rawData.rssi,
+//         beam: rawData.beam,
+//         beam_angle: beamAngle,
+//         device_name: rawData.device_name,
+//         manufacture: rawData.manufacture,
+//         stability: stability,
+//         is_stable: isStable,
+//         smoothed_position: matchedAsset.position || null,
+//         ap_history: matchedAsset.apHistory || [],
+//       },
+//       map: mapDetails
+//         ? {
+//             id: mapDetails.id,
+//             name: mapDetails.name,
+//             width: mapDetails.width,
+//             height: mapDetails.height,
+//             ppm: mapDetails.ppm,
+//             origin_x: mapDetails.origin_x,
+//             origin_y: mapDetails.origin_y,
+//             orientation: mapDetails.orientation,
+//             width_m: mapDetails.width_m,
+//             height_m: mapDetails.height_m,
+//           }
+//         : null,
+//       target_coordinates: {
+//         x: targetX,
+//         y: targetY,
+//       },
+//       distance: distance,
+//       proximity: proximityStatus,
+//       timestamp: new Date().toISOString(),
+//     };
+
+//     if (wayfindingPath && includePath === "true") {
+//       locationData.wayfinding = {
+//         total_nodes: wayfindingPath.nodes.length,
+//         total_edges: Object.keys(wayfindingPath.edges || {}).length,
+//         nearest_node: nearestNode
+//           ? {
+//               name: nearestNode.node.name,
+//               position: nearestNode.node.position,
+//               distance_pixels: nearestNode.distance,
+//               is_on_path: nearestNode.isOnPath,
+//             }
+//           : null,
+//         route_to_destination: routeToDestination
+//           ? {
+//               path: routeToDestination.path,
+//               segments: routeToDestination.segments,
+//               nodes: routeToDestination.nodes.map((node) => ({
+//                 name: node.name,
+//                 position: node.position,
+//               })),
+//             }
+//           : null,
+//         nodes: wayfindingPath.nodes.map((node) => ({
+//           name: node.name,
+//           position: node.position,
+//           edges: node.edges || {},
+//           worldPosition: convertMistToWorld(
+//             node.position.x,
+//             node.position.y,
+//             mapDetails,
+//           ),
+//         })),
+//         edges: wayfindingPath.edges,
+//       };
+//     }
+
+//     res.status(200).json({
+//       success: true,
+//       message: "Visitor location retrieved successfully",
+//       data: locationData,
+//     });
+//   } catch (error) {
+//     console.error("❌ Error fetching visitor location:", error);
+//     res.status(500).json({
+//       success: false,
+//       message: "Error fetching visitor location",
+//       error: error.message,
+//       stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
+//     });
+//   }
+// };
+// ============================
+// GET VISITOR LOCATION WITH ROUTE (ENHANCED)
+// ============================
+
 exports.getVisitorRoute = async (req, res) => {
   try {
     const { id } = req.params;
@@ -406,7 +674,6 @@ exports.getVisitorRoute = async (req, res) => {
       .filter((name) => name);
     console.log("📋 Available assets:", assetNames.join(", "));
 
-    // Find matched asset with enhanced data
     const matchedAsset = assets.find((asset) => {
       const rawData = asset.raw || asset;
       return (
@@ -482,25 +749,42 @@ exports.getVisitorRoute = async (req, res) => {
     const targetX = 5525.298750495607;
     const targetY = 2491.837930104785;
 
-    const distance =
+    // ============ FIX: Calculate distance in METERS ============
+    // Get PPM from map config
+    let ppm = 50.07391564392213; // Default PPM
+
+    if (rawData.map_id && MAP_CONFIGS[rawData.map_id]) {
+      ppm = MAP_CONFIGS[rawData.map_id].ppm;
+    }
+
+    // Calculate distance in pixels
+    const distancePixels =
       rawData.x && rawData.y
         ? Math.sqrt(
             Math.pow(rawData.x - targetX, 2) + Math.pow(rawData.y - targetY, 2),
           )
         : null;
 
+    // Convert to METERS
+    const distanceMeters =
+      distancePixels !== null ? distancePixels / ppm : null;
+
+    console.log(
+      `📏 Distance: ${distancePixels?.toFixed(2)} pixels = ${distanceMeters?.toFixed(2)} meters`,
+    );
+
+    // ============ FIX: Proximity based on METERS ============
     const proximityStatus =
-      distance !== null
-        ? distance < 100
-          ? "Very Close"
-          : distance < 300
-            ? "Close"
-            : distance < 500
-              ? "Moderate"
-              : "Far"
+      distanceMeters !== null
+        ? distanceMeters < 2
+          ? "Very Close" // Less than 2 meters
+          : distanceMeters < 5
+            ? "Close" // 2-5 meters
+            : distanceMeters < 10
+              ? "Moderate" // 5-10 meters
+              : "Far" // More than 10 meters
         : "Unknown";
 
-    // Get enhanced tracking data
     const stability = matchedAsset.stability || 1.0;
     const isStable = stability > 0.7;
     const beamAngle =
@@ -555,7 +839,11 @@ exports.getVisitorRoute = async (req, res) => {
         x: targetX,
         y: targetY,
       },
-      distance: distance,
+      // ============ FIX: Return both pixel and meter distances ============
+      distance: {
+        pixels: distancePixels,
+        meters: distanceMeters,
+      },
       proximity: proximityStatus,
       timestamp: new Date().toISOString(),
     };
@@ -611,7 +899,6 @@ exports.getVisitorRoute = async (req, res) => {
     });
   }
 };
-
 // ============================
 // GET WAYFINDING PATH ONLY
 // ============================
