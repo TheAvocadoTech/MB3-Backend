@@ -1,4 +1,4 @@
-// services/mistAssetTracker.js
+// services/mistAssetTracker.js - UPDATED WITH NORMALIZATION
 const axios = require("axios");
 const EventEmitter = require("events");
 
@@ -25,19 +25,9 @@ const MAP_CONFIGS = {
     origin_y: 3856.483584010582,
     ppm: 50.07391564392213,
   },
-  "8ddd401e-edb4-4b24-beb1-6298afdd0bd1": {
-    name: "MB3-F01",
-    width: 6400,
-    height: 5120,
-    width_m: 111.74050632911398,
-    height_m: 89.39240506329119,
-    origin_x: 6.786923314266026,
-    origin_y: 4134.933029216576,
-    ppm: 57.275559331634064,
-  },
 };
 
-// Beam angles (approximate center of each beam sector)
+// Beam angles
 const BEAM_ANGLES = {
   0: 0,
   1: 20,
@@ -63,10 +53,11 @@ class AssetTracker extends EventEmitter {
   constructor() {
     super();
     this.assetStates = new Map();
-    this.updateHistory = new Map();
     this.filterWindows = new Map();
+    this.bestLocationCache = new Map(); // Store best location per asset
     this.WINDOW_SIZE = 5;
     this.STABILITY_THRESHOLD = 2.0;
+    this.LOWEST_RSSI_THRESHOLD = -60; // RSSI below this is considered good
   }
 
   async getAssets() {
@@ -97,31 +88,50 @@ class AssetTracker extends EventEmitter {
 
     for (const [mac, detections] of assetGroups) {
       try {
+        // STEP 1: Find the detection with the LOWEST RSSI (most accurate)
         const bestDetection = this.selectBestAP(detections, mac);
 
         if (!bestDetection) continue;
 
-        const convertedCoords = this.convertCoordinates(
-          bestDetection.x,
-          bestDetection.y,
-          bestDetection.map_id,
-        );
+        // STEP 2: Check if this is the most accurate location so far
+        const isMostAccurate = this.isMostAccurateLocation(bestDetection, mac);
 
+        // STEP 3: Get or create asset state
         let assetState = this.assetStates.get(mac);
         if (!assetState) {
           assetState = {
             mac,
             device_name: bestDetection.device_name,
             map_id: bestDetection.map_id,
-            currentPosition: convertedCoords,
-            previousPositions: [],
+            currentPosition: null,
+            bestPosition: null, // Store the best (most accurate) position
+            bestRSSI: Infinity, // Track the best RSSI seen
             lastUpdate: Date.now(),
             apHistory: [],
             stabilityScore: 1.0,
+            positionStable: false,
           };
           this.assetStates.set(mac, assetState);
         }
 
+        // STEP 4: Convert coordinates
+        const convertedCoords = this.convertCoordinates(
+          bestDetection.x,
+          bestDetection.y,
+          bestDetection.map_id,
+        );
+
+        // STEP 5: Update best position if this is more accurate
+        if (isMostAccurate) {
+          assetState.bestPosition = convertedCoords;
+          assetState.bestRSSI = bestDetection.rssi;
+          assetState.positionStable = true;
+          console.log(
+            `📍 Asset ${mac}: Using most accurate position with RSSI ${bestDetection.rssi} dBm`,
+          );
+        }
+
+        // STEP 6: Smooth the position using weighted average
         const smoothedPosition = this.smoothPosition(
           convertedCoords,
           bestDetection.rssi,
@@ -130,13 +140,20 @@ class AssetTracker extends EventEmitter {
           bestDetection.beam,
         );
 
-        assetState.currentPosition = smoothedPosition;
+        // STEP 7: Use the BEST position if available and stable
+        if (assetState.bestPosition && assetState.positionStable) {
+          assetState.currentPosition = assetState.bestPosition;
+        } else {
+          assetState.currentPosition = smoothedPosition;
+        }
+
         assetState.lastUpdate = Date.now();
         assetState.apHistory.push({
           ap_mac: bestDetection.ap_mac,
           rssi: bestDetection.rssi,
           beam: bestDetection.beam,
           timestamp: Date.now(),
+          is_most_accurate: isMostAccurate,
         });
 
         if (assetState.apHistory.length > 10) {
@@ -145,19 +162,22 @@ class AssetTracker extends EventEmitter {
 
         assetState.stabilityScore = this.calculateStability(assetState);
 
+        // Emit event
         this.emit("assetUpdate", {
           mac,
           device_name: assetState.device_name,
-          position: smoothedPosition,
+          position: assetState.currentPosition,
           raw: bestDetection,
           stability: assetState.stabilityScore,
+          is_most_accurate: isMostAccurate,
+          best_rssi: assetState.bestRSSI,
           timestamp: Date.now(),
         });
 
         processedAssets.push({
           mac,
           device_name: assetState.device_name,
-          position: smoothedPosition,
+          position: assetState.currentPosition,
           ap_mac: bestDetection.ap_mac,
           rssi: bestDetection.rssi,
           beam: bestDetection.beam,
@@ -165,6 +185,8 @@ class AssetTracker extends EventEmitter {
           map_id: bestDetection.map_id,
           raw: bestDetection,
           apHistory: assetState.apHistory.slice(-3),
+          is_most_accurate: isMostAccurate,
+          best_rssi: assetState.bestRSSI,
         });
       } catch (error) {
         console.error(`Error processing asset ${mac}:`, error);
@@ -173,6 +195,30 @@ class AssetTracker extends EventEmitter {
 
     this.cleanupOldStates();
     return processedAssets;
+  }
+
+  // NEW: Check if this detection is the most accurate (lowest RSSI)
+  isMostAccurateLocation(detection, mac) {
+    const assetState = this.assetStates.get(mac);
+
+    // If no previous state, this is the most accurate
+    if (!assetState) {
+      return true;
+    }
+
+    // If RSSI is lower (better signal) than previous best, update
+    if (detection.rssi < assetState.bestRSSI) {
+      return true;
+    }
+
+    // If RSSI is within 2 dBm of best, keep it stable
+    if (Math.abs(detection.rssi - assetState.bestRSSI) <= 2) {
+      // Keep the existing best position to avoid jumping
+      return false;
+    }
+
+    // If signal got worse, don't update
+    return false;
   }
 
   groupDetectionsByAsset(assets) {
@@ -205,13 +251,14 @@ class AssetTracker extends EventEmitter {
     const scoredDetections = detections.map((detection) => {
       let score = 0;
 
-      // 1. RSSI Score
-      const rssiScore = Math.max(0, (detection.rssi + 100) / 50);
-      score += rssiScore * 0.4;
+      // 1. RSSI Score (LOWER RSSI = HIGHER SCORE - More accurate)
+      // RSSI range: -30 to -100, we want closer to -30
+      const rssiScore = Math.max(0, (detection.rssi + 100) / 70); // -30 = 1, -100 = 0
+      score += rssiScore * 0.5; // 50% weight - MOST IMPORTANT
 
-      // 2. AP Stability Score
+      // 2. AP Stability Score (prefer consistent AP)
       if (detection.ap_mac === previousAP) {
-        score += 0.3;
+        score += 0.2;
       }
 
       // 3. Position Continuity Score
@@ -231,7 +278,7 @@ class AssetTracker extends EventEmitter {
 
         const continuityScore = Math.max(
           0,
-          0.3 * (1 - Math.min(1, distance / 10)),
+          0.2 * (1 - Math.min(1, distance / 10)),
         );
         score += continuityScore;
       }
@@ -257,22 +304,22 @@ class AssetTracker extends EventEmitter {
         let angleDiff = Math.abs(beamAngle - normalizedExpected);
         angleDiff = Math.min(angleDiff, 360 - angleDiff);
 
-        const beamScore = Math.max(0, 0.3 * (1 - Math.min(1, angleDiff / 90)));
+        const beamScore = Math.max(0, 0.1 * (1 - Math.min(1, angleDiff / 90)));
         score += beamScore;
       }
 
       return { detection, score };
     });
 
+    // Sort by score descending (highest = best)
     scoredDetections.sort((a, b) => b.score - a.score);
 
-    if (scoredDetections.length > 1) {
-      console.log(
-        `Asset ${mac}: Selected AP ${scoredDetections[0].detection.ap_mac} with score ${scoredDetections[0].score.toFixed(3)}`,
-      );
-    }
+    const best = scoredDetections[0].detection;
+    console.log(
+      `Asset ${mac}: Selected AP ${best.ap_mac} with RSSI ${best.rssi} dBm (score: ${scoredDetections[0].score.toFixed(3)})`,
+    );
 
-    return scoredDetections[0].detection;
+    return best;
   }
 
   convertCoordinates(x, y, mapId) {
@@ -317,13 +364,19 @@ class AssetTracker extends EventEmitter {
       return coords;
     }
 
+    // Weighted average - give MORE weight to lower RSSI readings
     let totalWeight = 0;
     let weightedX = 0;
     let weightedY = 0;
 
-    const weights = window.map((sample, index) => {
-      const rssiWeight = Math.max(0, (sample.rssi + 100) / 40);
-      const recencyWeight = (index + 1) / window.length;
+    const weights = window.map((sample) => {
+      // RSSI weight: lower RSSI = higher weight (signal is stronger)
+      const rssiWeight = Math.max(0.1, (sample.rssi + 100) / 40);
+
+      // Recency weight: newer = higher
+      const recencyWeight = 0.3;
+
+      // Combined: 70% RSSI, 30% recency
       return rssiWeight * 0.7 + recencyWeight * 0.3;
     });
 
@@ -341,6 +394,7 @@ class AssetTracker extends EventEmitter {
     const smoothedX = weightedX / totalWeight;
     const smoothedY = weightedY / totalWeight;
 
+    // Check for large jumps
     const lastPosition = window[window.length - 2];
     if (lastPosition) {
       const distance = this.calculateDistance(
@@ -350,14 +404,19 @@ class AssetTracker extends EventEmitter {
         smoothedY,
       );
 
+      // If jump is too large, use the best position if available
       if (distance > this.STABILITY_THRESHOLD) {
-        console.log(
-          `Large jump detected for ${mac}: ${distance.toFixed(2)}m, applying extra smoothing`,
-        );
+        const assetState = this.assetStates.get(mac);
+        if (assetState && assetState.bestPosition) {
+          console.log(
+            `⚠️ Large jump detected for ${mac}: ${distance.toFixed(2)}m, using best position`,
+          );
+          return assetState.bestPosition;
+        }
 
+        // Otherwise, blend with previous
         const blendedX = (lastPosition.coords.x_m + smoothedX) / 2;
         const blendedY = (lastPosition.coords.y_m + smoothedY) / 2;
-
         return { x_m: blendedX, y_m: blendedY };
       }
     }
@@ -374,30 +433,16 @@ class AssetTracker extends EventEmitter {
       return 1.0;
     }
 
+    // Check if we have a stable best position
+    if (assetState.positionStable && assetState.bestPosition) {
+      return 1.0;
+    }
+
     const recentAPs = assetState.apHistory.slice(-5);
     const uniqueAPs = new Set(recentAPs.map((h) => h.ap_mac));
     const apConsistency = 1 - (uniqueAPs.size - 1) / 4;
 
-    let positionStability = 1.0;
-    if (
-      assetState.previousPositions &&
-      assetState.previousPositions.length > 2
-    ) {
-      const recentPositions = assetState.previousPositions.slice(-3);
-      let totalDistance = 0;
-      for (let i = 1; i < recentPositions.length; i++) {
-        totalDistance += this.calculateDistance(
-          recentPositions[i - 1].x_m,
-          recentPositions[i - 1].y_m,
-          recentPositions[i].x_m,
-          recentPositions[i].y_m,
-        );
-      }
-      const avgMovement = totalDistance / (recentPositions.length - 1);
-      positionStability = Math.max(0, 1 - avgMovement / 5);
-    }
-
-    return apConsistency * 0.6 + positionStability * 0.4;
+    return apConsistency * 0.6 + 0.4;
   }
 
   cleanupOldStates() {
@@ -408,7 +453,7 @@ class AssetTracker extends EventEmitter {
       if (now - state.lastUpdate > timeout) {
         this.assetStates.delete(mac);
         this.filterWindows.delete(mac);
-        this.updateHistory.delete(mac);
+        this.bestLocationCache.delete(mac);
       }
     }
   }
@@ -419,7 +464,10 @@ class AssetTracker extends EventEmitter {
       states[mac] = {
         device_name: state.device_name,
         position: state.currentPosition,
+        best_position: state.bestPosition,
+        best_rssi: state.bestRSSI,
         stability: state.stabilityScore,
+        is_stable: state.positionStable,
         lastUpdate: state.lastUpdate,
         apHistory: state.apHistory.slice(-3),
       };
@@ -430,8 +478,9 @@ class AssetTracker extends EventEmitter {
   resetAsset(mac) {
     this.assetStates.delete(mac);
     this.filterWindows.delete(mac);
-    this.updateHistory.delete(mac);
+    this.bestLocationCache.delete(mac);
   }
 }
 
+console.log("✅ AssetTracker service loaded with normalization");
 module.exports = new AssetTracker();
