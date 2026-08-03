@@ -40,7 +40,7 @@ assetTracker.on("assetUpdate", (update) => {
 });
 
 // Run update every 5 seconds
-setInterval(updateAssets, 5000);
+setInterval(updateAssets, 2000);
 
 // Initial update
 updateAssets();

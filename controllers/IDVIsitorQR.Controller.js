@@ -1648,6 +1648,56 @@ exports.getVisitorCabinet = async (req, res) => {
 };
 
 // ===== UPDATE VISITOR CABINET =====
+// exports.updateVisitorCabinet = async (req, res) => {
+//   try {
+//     const { id } = req.params;
+//     const { idNumber, assetName } = req.body;
+
+//     if (!mongoose.Types.ObjectId.isValid(id)) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Invalid visitor ID",
+//       });
+//     }
+
+//     if (!idNumber && !assetName) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "idNumber or assetName is required",
+//       });
+//     }
+
+//     const visitor = await QRModel.findById(id);
+
+//     if (!visitor) {
+//       return res.status(404).json({
+//         success: false,
+//         message: "Visitor not found",
+//       });
+//     }
+
+//     visitor.idNumber = idNumber || assetName;
+//     await visitor.save();
+
+//     res.status(200).json({
+//       success: true,
+//       message: "Visitor cabinet updated successfully",
+//       data: {
+//         id: visitor._id,
+//         visitorName: visitor.visitorName,
+//         idNumber: visitor.idNumber,
+//       },
+//     });
+//   } catch (error) {
+//     console.error("Error updating visitor cabinet:", error);
+//     res.status(500).json({
+//       success: false,
+//       message: "Error updating visitor cabinet",
+//       error: error.message,
+//     });
+//   }
+// };
+// Only the relevant function – replace in your file
 exports.updateVisitorCabinet = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1676,7 +1726,37 @@ exports.updateVisitorCabinet = async (req, res) => {
       });
     }
 
-    visitor.idNumber = idNumber || assetName;
+    const newIdNumber = idNumber || assetName;
+
+    // Verify asset exists in Mist
+    try {
+      const assets = await fetchAssetLocations();
+      const assetExists = assets.some((asset) => {
+        const rawData = asset.raw || asset;
+        return rawData.name === newIdNumber || rawData.mac === newIdNumber;
+      });
+
+      if (!assetExists) {
+        // Return a list of available assets to help the user
+        const assetNames = assets
+          .map((a) => a.raw?.name || a.name)
+          .filter((name) => name);
+        return res.status(400).json({
+          success: false,
+          message: `Asset "${newIdNumber}" not found in Mist system`,
+          available_assets: assetNames,
+        });
+      }
+    } catch (error) {
+      console.warn("⚠️ Could not verify asset in Mist:", error.message);
+      // Proceed anyway – the location endpoint will fail if asset not found
+    }
+
+    // Update idNumber (and other fields if your schema supports them)
+    visitor.idNumber = newIdNumber;
+    // Uncomment if your model has these fields:
+    // visitor.mistAssetId = newIdNumber;
+    // visitor.mistMacAddress = newIdNumber;
     await visitor.save();
 
     res.status(200).json({
@@ -1689,7 +1769,7 @@ exports.updateVisitorCabinet = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Error updating visitor cabinet:", error);
+    console.error("❌ Error updating visitor cabinet:", error);
     res.status(500).json({
       success: false,
       message: "Error updating visitor cabinet",

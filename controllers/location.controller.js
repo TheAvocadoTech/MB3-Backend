@@ -5,7 +5,7 @@ const mongoose = require("mongoose");
 const AssetTracker = require("../services/mistAssetTracker");
 
 // ============================
-// MIST API CONFIGURATIONg
+// MIST API CONFIGURATION
 // ============================
 
 const MIST_API_TOKEN =
@@ -63,28 +63,53 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
+// const fetchAssetLocations = async () => {
+//   try {
+//     const processedAssets = await AssetTracker.getAssets();
+//     return processedAssets;
+//   } catch (error) {
+//     console.error("❌ Mist API Error:", error.response?.data || error.message);
+//     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
+//     console.log("📡 Fetching assets from Mist API:", url);
+//     const response = await axios.get(url, {
+//       headers: getMistHeaders(),
+//     });
+//     console.log(`✅ Found ${response.data.length} assets`);
+//     return response.data;
+//   }
+// };
+
+// ============================
+// WAYFINDING PATH HELPERS
+// ============================
 const fetchAssetLocations = async () => {
   try {
-    // Use the enhanced AssetTracker
+    // Get cached assets from AssetTracker (no API call)
+    const cachedAssets = AssetTracker.getCachedAssets();
+    if (cachedAssets && cachedAssets.length > 0) {
+      console.log(
+        `✅ Using ${cachedAssets.length} cached assets (no API call)`,
+      );
+      return cachedAssets;
+    }
+
+    // Fallback: if cache is empty, force a fresh fetch (this will call the API)
+    console.log("⚠️ Cache empty, fetching from Mist API...");
     const processedAssets = await AssetTracker.getAssets();
     return processedAssets;
   } catch (error) {
-    console.error("❌ Mist API Error:", error.response?.data || error.message);
-    // Fallback to direct API call
+    console.error(
+      "❌ Mist API Error (fallback):",
+      error.response?.data || error.message,
+    );
+    // Final fallback: direct API call (if AssetTracker fails)
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
-    console.log("📡 Fetching assets from Mist API:", url);
     const response = await axios.get(url, {
       headers: getMistHeaders(),
     });
-    console.log(`✅ Found ${response.data.length} assets`);
     return response.data;
   }
 };
-
-// ============================
-// FIXED: WAYFINDING PATH HELPERS
-// ============================
-
 const fetchMapDetails = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
@@ -107,7 +132,6 @@ const fetchMapDetails = async (mapId) => {
       nodesCount: data.wayfinding_path?.nodes?.length || 0,
     });
 
-    // Return ALL map data including wayfinding_path
     return {
       id: data.id,
       name: data.name,
@@ -137,28 +161,21 @@ const fetchMapDetails = async (mapId) => {
   }
 };
 
-/**
- * Fetch wayfinding path for a specific map
- * Handles different response formats from Mist API
- */
 const fetchWayfindingPath = async (mapId) => {
   try {
     const mapDetails = await fetchMapDetails(mapId);
-
     if (!mapDetails) {
       console.log(`❌ Map ${mapId} not found`);
       return null;
     }
 
     console.log(`🗺️ Checking map ${mapId} for wayfinding data...`);
-
     if (!mapDetails.wayfinding_path) {
       console.log(`⚠️ No wayfinding_path found in map ${mapId}`);
       return null;
     }
 
     const wayfindingData = mapDetails.wayfinding_path;
-
     if (
       !wayfindingData.nodes ||
       !Array.isArray(wayfindingData.nodes) ||
@@ -174,7 +191,6 @@ const fetchWayfindingPath = async (mapId) => {
 
     const transformedNodes = wayfindingData.nodes.map((node) => {
       let edges = node.edges || {};
-
       if (typeof edges === "object" && !Array.isArray(edges)) {
         const edgeObj = {};
         Object.keys(edges).forEach((key) => {
@@ -182,7 +198,6 @@ const fetchWayfindingPath = async (mapId) => {
         });
         edges = edgeObj;
       }
-
       return {
         ...node,
         edges: edges,
@@ -209,9 +224,6 @@ const fetchWayfindingPath = async (mapId) => {
   }
 };
 
-/**
- * Find the nearest node on the wayfinding path to a given asset position
- */
 const findNearestNode = (wayfindingPath, assetX, assetY) => {
   if (
     !wayfindingPath ||
@@ -248,9 +260,6 @@ const findNearestNode = (wayfindingPath, assetX, assetY) => {
   };
 };
 
-/**
- * Build a route from start node to destination node using BFS
- */
 const findRoute = (wayfindingPath, startNodeName, destNodeName) => {
   if (!wayfindingPath || !wayfindingPath.nodes || !wayfindingPath.edges) {
     return null;
@@ -344,891 +353,9 @@ const convertWayfindingNodes = (nodes, mapData) => {
 };
 
 // ============================
-// GET VISITOR LOCATION WITH ROUTE (ENHANCED)
+// GET VISITOR LOCATION WITH ROUTE (FULLY IMPLEMENTED)
 // ============================
 
-// exports.getVisitorRoute = async (req, res) => {
-//   try {
-//     const { id } = req.params;
-//     const { includePath = "true" } = req.query;
-
-//     console.log("📍 Fetching location for visitor ID:", id);
-
-//     if (!mongoose.Types.ObjectId.isValid(id)) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Invalid visitor ID format",
-//       });
-//     }
-
-//     const visitor = await QRModel.findById(id);
-
-//     if (!visitor) {
-//       return res.status(404).json({
-//         success: false,
-//         message: "Visitor not found",
-//       });
-//     }
-
-//     console.log("👤 Visitor found:", visitor.visitorName);
-//     console.log("🆔 ID Number:", visitor.idNumber || "(empty)");
-
-//     if (!visitor.idNumber || visitor.idNumber.trim() === "") {
-//       return res.status(404).json({
-//         success: false,
-//         message: "No ID/asset assigned to this visitor.",
-//         suggestion:
-//           "Use PUT /api/IDVisitor/visitors/:id/cabinet with { 'idNumber': 'Tag1' }",
-//         visitor: {
-//           id: visitor._id,
-//           name: visitor.visitorName,
-//           company: visitor.company,
-//           currentIdNumber: visitor.idNumber || "Not assigned",
-//         },
-//       });
-//     }
-
-//     console.log("📡 Fetching asset locations from Mist API...");
-//     let assets;
-//     try {
-//       assets = await fetchAssetLocations();
-//     } catch (error) {
-//       console.error("❌ Mist API Error:", error.message);
-//       return res.status(500).json({
-//         success: false,
-//         message: "Failed to fetch asset locations from Mist API",
-//         error: error.message,
-//       });
-//     }
-
-//     const assetNames = assets
-//       .map((a) => a.raw?.name || a.name)
-//       .filter((name) => name);
-//     console.log("📋 Available assets:", assetNames.join(", "));
-
-//     // Find matched asset with enhanced data
-//     const matchedAsset = assets.find((asset) => {
-//       const rawData = asset.raw || asset;
-//       return (
-//         rawData.name === visitor.idNumber || rawData.mac === visitor.idNumber
-//       );
-//     });
-
-//     if (!matchedAsset) {
-//       return res.status(404).json({
-//         success: false,
-//         message: `Asset "${visitor.idNumber}" not found in Mist system`,
-//         available_assets: assetNames,
-//         suggestion:
-//           "Make sure the idNumber matches an asset name in Mist. Available assets: " +
-//           assetNames.join(", "),
-//       });
-//     }
-
-//     const rawData = matchedAsset.raw || matchedAsset;
-
-//     console.log("✅ Asset found:", rawData.name);
-
-//     if (!rawData.x || !rawData.y) {
-//       return res.status(404).json({
-//         success: false,
-//         message: `Asset "${rawData.name}" found but has no location data`,
-//         data: {
-//           name: rawData.name,
-//           mac: rawData.mac,
-//           last_seen: rawData.last_seen,
-//           has_location: false,
-//         },
-//       });
-//     }
-
-//     let mapDetails = null;
-//     let wayfindingPath = null;
-//     let nearestNode = null;
-//     let routeToDestination = null;
-
-//     if (rawData.map_id) {
-//       try {
-//         mapDetails = await fetchMapDetails(rawData.map_id);
-
-//         if (includePath === "true") {
-//           wayfindingPath = await fetchWayfindingPath(rawData.map_id);
-
-//           if (
-//             wayfindingPath &&
-//             wayfindingPath.nodes &&
-//             wayfindingPath.nodes.length > 0
-//           ) {
-//             const targetX = 5525.298750495607;
-//             const targetY = 2491.837930104785;
-
-//             nearestNode = findNearestNode(wayfindingPath, rawData.x, rawData.y);
-//             const destNode = findNearestNode(wayfindingPath, targetX, targetY);
-
-//             if (nearestNode && nearestNode.node && destNode && destNode.node) {
-//               routeToDestination = findRoute(
-//                 wayfindingPath,
-//                 nearestNode.node.name,
-//                 destNode.node.name,
-//               );
-//             }
-//           }
-//         }
-//       } catch (error) {
-//         console.warn("⚠️ Could not fetch wayfinding data:", error.message);
-//       }
-//     }
-
-//     const targetX = 5525.298750495607;
-//     const targetY = 2491.837930104785;
-
-//     const distance =
-//       rawData.x && rawData.y
-//         ? Math.sqrt(
-//             Math.pow(rawData.x - targetX, 2) + Math.pow(rawData.y - targetY, 2),
-//           )
-//         : null;
-
-//     const proximityStatus =
-//       distance !== null
-//         ? distance < 100
-//           ? "Very Close"
-//           : distance < 300
-//             ? "Close"
-//             : distance < 500
-//               ? "Moderate"
-//               : "Far"
-//         : "Unknown";
-
-//     // Get enhanced tracking data
-//     const stability = matchedAsset.stability || 1.0;
-//     const isStable = stability > 0.7;
-//     const beamAngle =
-//       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
-
-//     const locationData = {
-//       visitor: {
-//         id: visitor._id,
-//         name: visitor.visitorName,
-//         phone: visitor.phoneNumber,
-//         email: visitor.email,
-//         company: visitor.company,
-//         idNumber: visitor.idNumber,
-//         purpose: visitor.purpose,
-//         checkedIn: visitor.checkedIn,
-//         checkedInAt: visitor.checkedInAt,
-//         qrExpiresAt: visitor.qrExpiresAt,
-//       },
-//       location: {
-//         x: rawData.x,
-//         y: rawData.y,
-//         name: rawData.name,
-//         mac: rawData.mac,
-//         map_id: rawData.map_id,
-//         ap_mac: rawData.ap_mac,
-//         last_seen: rawData.last_seen,
-//         rssi: rawData.rssi,
-//         beam: rawData.beam,
-//         beam_angle: beamAngle,
-//         device_name: rawData.device_name,
-//         manufacture: rawData.manufacture,
-//         stability: stability,
-//         is_stable: isStable,
-//         smoothed_position: matchedAsset.position || null,
-//         ap_history: matchedAsset.apHistory || [],
-//       },
-//       map: mapDetails
-//         ? {
-//             id: mapDetails.id,
-//             name: mapDetails.name,
-//             width: mapDetails.width,
-//             height: mapDetails.height,
-//             ppm: mapDetails.ppm,
-//             origin_x: mapDetails.origin_x,
-//             origin_y: mapDetails.origin_y,
-//             orientation: mapDetails.orientation,
-//             width_m: mapDetails.width_m,
-//             height_m: mapDetails.height_m,
-//           }
-//         : null,
-//       target_coordinates: {
-//         x: targetX,
-//         y: targetY,
-//       },
-//       distance: distance,
-//       proximity: proximityStatus,
-//       timestamp: new Date().toISOString(),
-//     };
-
-//     if (wayfindingPath && includePath === "true") {
-//       locationData.wayfinding = {
-//         total_nodes: wayfindingPath.nodes.length,
-//         total_edges: Object.keys(wayfindingPath.edges || {}).length,
-//         nearest_node: nearestNode
-//           ? {
-//               name: nearestNode.node.name,
-//               position: nearestNode.node.position,
-//               distance_pixels: nearestNode.distance,
-//               is_on_path: nearestNode.isOnPath,
-//             }
-//           : null,
-//         route_to_destination: routeToDestination
-//           ? {
-//               path: routeToDestination.path,
-//               segments: routeToDestination.segments,
-//               nodes: routeToDestination.nodes.map((node) => ({
-//                 name: node.name,
-//                 position: node.position,
-//               })),
-//             }
-//           : null,
-//         nodes: wayfindingPath.nodes.map((node) => ({
-//           name: node.name,
-//           position: node.position,
-//           edges: node.edges || {},
-//           worldPosition: convertMistToWorld(
-//             node.position.x,
-//             node.position.y,
-//             mapDetails,
-//           ),
-//         })),
-//         edges: wayfindingPath.edges,
-//       };
-//     }
-
-//     res.status(200).json({
-//       success: true,
-//       message: "Visitor location retrieved successfully",
-//       data: locationData,
-//     });
-//   } catch (error) {
-//     console.error("❌ Error fetching visitor location:", error);
-//     res.status(500).json({
-//       success: false,
-//       message: "Error fetching visitor location",
-//       error: error.message,
-//       stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
-//     });
-//   }
-// };
-// ============================
-// GET VISITOR LOCATION WITH ROUTE (ENHANCED)
-// ============================
-
-// exports.getVisitorRoute = async (req, res) => {
-//   try {
-//     const { id } = req.params;
-//     const { includePath = "true" } = req.query;
-
-//     console.log("📍 Fetching location for visitor ID:", id);
-
-//     if (!mongoose.Types.ObjectId.isValid(id)) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Invalid visitor ID format",
-//       });
-//     }
-
-//     const visitor = await QRModel.findById(id);
-
-//     if (!visitor) {
-//       return res.status(404).json({
-//         success: false,
-//         message: "Visitor not found",
-//       });
-//     }
-
-//     console.log("👤 Visitor found:", visitor.visitorName);
-//     console.log("🆔 ID Number:", visitor.idNumber || "(empty)");
-
-//     if (!visitor.idNumber || visitor.idNumber.trim() === "") {
-//       return res.status(404).json({
-//         success: false,
-//         message: "No ID/asset assigned to this visitor.",
-//         suggestion:
-//           "Use PUT /api/IDVisitor/visitors/:id/cabinet with { 'idNumber': 'Tag1' }",
-//         visitor: {
-//           id: visitor._id,
-//           name: visitor.visitorName,
-//           company: visitor.company,
-//           currentIdNumber: visitor.idNumber || "Not assigned",
-//         },
-//       });
-//     }
-
-//     console.log("📡 Fetching asset locations from Mist API...");
-//     let assets;
-//     try {
-//       assets = await fetchAssetLocations();
-//     } catch (error) {
-//       console.error("❌ Mist API Error:", error.message);
-//       return res.status(500).json({
-//         success: false,
-//         message: "Failed to fetch asset locations from Mist API",
-//         error: error.message,
-//       });
-//     }
-
-//     const assetNames = assets
-//       .map((a) => a.raw?.name || a.name)
-//       .filter((name) => name);
-//     console.log("📋 Available assets:", assetNames.join(", "));
-
-//     const matchedAsset = assets.find((asset) => {
-//       const rawData = asset.raw || asset;
-//       return (
-//         rawData.name === visitor.idNumber || rawData.mac === visitor.idNumber
-//       );
-//     });
-
-//     if (!matchedAsset) {
-//       return res.status(404).json({
-//         success: false,
-//         message: `Asset "${visitor.idNumber}" not found in Mist system`,
-//         available_assets: assetNames,
-//         suggestion:
-//           "Make sure the idNumber matches an asset name in Mist. Available assets: " +
-//           assetNames.join(", "),
-//       });
-//     }
-
-//     const rawData = matchedAsset.raw || matchedAsset;
-
-//     console.log("✅ Asset found:", rawData.name);
-
-//     if (!rawData.x || !rawData.y) {
-//       return res.status(404).json({
-//         success: false,
-//         message: `Asset "${rawData.name}" found but has no location data`,
-//         data: {
-//           name: rawData.name,
-//           mac: rawData.mac,
-//           last_seen: rawData.last_seen,
-//           has_location: false,
-//         },
-//       });
-//     }
-
-//     let mapDetails = null;
-//     let wayfindingPath = null;
-//     let nearestNode = null;
-//     let routeToDestination = null;
-
-//     if (rawData.map_id) {
-//       try {
-//         mapDetails = await fetchMapDetails(rawData.map_id);
-
-//         if (includePath === "true") {
-//           wayfindingPath = await fetchWayfindingPath(rawData.map_id);
-
-//           if (
-//             wayfindingPath &&
-//             wayfindingPath.nodes &&
-//             wayfindingPath.nodes.length > 0
-//           ) {
-//             const targetX = 5525.298750495607;
-//             const targetY = 2491.837930104785;
-
-//             nearestNode = findNearestNode(wayfindingPath, rawData.x, rawData.y);
-//             const destNode = findNearestNode(wayfindingPath, targetX, targetY);
-
-//             if (nearestNode && nearestNode.node && destNode && destNode.node) {
-//               routeToDestination = findRoute(
-//                 wayfindingPath,
-//                 nearestNode.node.name,
-//                 destNode.node.name,
-//               );
-//             }
-//           }
-//         }
-//       } catch (error) {
-//         console.warn("⚠️ Could not fetch wayfinding data:", error.message);
-//       }
-//     }
-
-//     const targetX = 5525.298750495607;
-//     const targetY = 2491.837930104785;
-
-//     // ============ FIX: Calculate distance in METERS ============
-//     // Get PPM from map config
-//     let ppm = 50.07391564392213; // Default PPM
-
-//     if (rawData.map_id && MAP_CONFIGS[rawData.map_id]) {
-//       ppm = MAP_CONFIGS[rawData.map_id].ppm;
-//     }
-
-//     // Calculate distance in pixels
-//     const distancePixels =
-//       rawData.x && rawData.y
-//         ? Math.sqrt(
-//             Math.pow(rawData.x - targetX, 2) + Math.pow(rawData.y - targetY, 2),
-//           )
-//         : null;
-
-//     // Convert to METERS
-//     const distanceMeters =
-//       distancePixels !== null ? distancePixels / ppm : null;
-
-//     console.log(
-//       `📏 Distance: ${distancePixels?.toFixed(2)} pixels = ${distanceMeters?.toFixed(2)} meters`,
-//     );
-
-//     // ============ FIX: Proximity based on METERS ============
-//     const proximityStatus =
-//       distanceMeters !== null
-//         ? distanceMeters < 2
-//           ? "Very Close" // Less than 2 meters
-//           : distanceMeters < 5
-//             ? "Close" // 2-5 meters
-//             : distanceMeters < 10
-//               ? "Moderate" // 5-10 meters
-//               : "Far" // More than 10 meters
-//         : "Unknown";
-
-//     const stability = matchedAsset.stability || 1.0;
-//     const isStable = stability > 0.7;
-//     const beamAngle =
-//       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
-
-//     const locationData = {
-//       visitor: {
-//         id: visitor._id,
-//         name: visitor.visitorName,
-//         phone: visitor.phoneNumber,
-//         email: visitor.email,
-//         company: visitor.company,
-//         idNumber: visitor.idNumber,
-//         purpose: visitor.purpose,
-//         checkedIn: visitor.checkedIn,
-//         checkedInAt: visitor.checkedInAt,
-//         qrExpiresAt: visitor.qrExpiresAt,
-//       },
-//       location: {
-//         x: rawData.x,
-//         y: rawData.y,
-//         name: rawData.name,
-//         mac: rawData.mac,
-//         map_id: rawData.map_id,
-//         ap_mac: rawData.ap_mac,
-//         last_seen: rawData.last_seen,
-//         rssi: rawData.rssi,
-//         beam: rawData.beam,
-//         beam_angle: beamAngle,
-//         device_name: rawData.device_name,
-//         manufacture: rawData.manufacture,
-//         stability: stability,
-//         is_stable: isStable,
-//         smoothed_position: matchedAsset.position || null,
-//         ap_history: matchedAsset.apHistory || [],
-//       },
-//       map: mapDetails
-//         ? {
-//             id: mapDetails.id,
-//             name: mapDetails.name,
-//             width: mapDetails.width,
-//             height: mapDetails.height,
-//             ppm: mapDetails.ppm,
-//             origin_x: mapDetails.origin_x,
-//             origin_y: mapDetails.origin_y,
-//             orientation: mapDetails.orientation,
-//             width_m: mapDetails.width_m,
-//             height_m: mapDetails.height_m,
-//           }
-//         : null,
-//       target_coordinates: {
-//         x: targetX,
-//         y: targetY,
-//       },
-//       // ============ FIX: Return both pixel and meter distances ============
-//       distance: {
-//         pixels: distancePixels,
-//         meters: distanceMeters,
-//       },
-//       proximity: proximityStatus,
-//       timestamp: new Date().toISOString(),
-//     };
-
-//     if (wayfindingPath && includePath === "true") {
-//       locationData.wayfinding = {
-//         total_nodes: wayfindingPath.nodes.length,
-//         total_edges: Object.keys(wayfindingPath.edges || {}).length,
-//         nearest_node: nearestNode
-//           ? {
-//               name: nearestNode.node.name,
-//               position: nearestNode.node.position,
-//               distance_pixels: nearestNode.distance,
-//               is_on_path: nearestNode.isOnPath,
-//             }
-//           : null,
-//         route_to_destination: routeToDestination
-//           ? {
-//               path: routeToDestination.path,
-//               segments: routeToDestination.segments,
-//               nodes: routeToDestination.nodes.map((node) => ({
-//                 name: node.name,
-//                 position: node.position,
-//               })),
-//             }
-//           : null,
-//         nodes: wayfindingPath.nodes.map((node) => ({
-//           name: node.name,
-//           position: node.position,
-//           edges: node.edges || {},
-//           worldPosition: convertMistToWorld(
-//             node.position.x,
-//             node.position.y,
-//             mapDetails,
-//           ),
-//         })),
-//         edges: wayfindingPath.edges,
-//       };
-//     }
-
-//     res.status(200).json({
-//       success: true,
-//       message: "Visitor location retrieved successfully",
-//       data: locationData,
-//     });
-//   } catch (error) {
-//     console.error("❌ Error fetching visitor location:", error);
-//     res.status(500).json({
-//       success: false,
-//       message: "Error fetching visitor location",
-//       error: error.message,
-//       stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
-//     });
-//   }
-// };
-// exports.getVisitorRoute = async (req, res) => {
-//   try {
-//     const { id } = req.params;
-//     const { includePath = "true" } = req.query;
-
-//     console.log("📍 Fetching location for visitor ID:", id);
-
-//     if (!mongoose.Types.ObjectId.isValid(id)) {
-//       return res.status(400).json({
-//         success: false,
-//         message: "Invalid visitor ID format",
-//       });
-//     }
-
-//     const visitor = await QRModel.findById(id);
-
-//     if (!visitor) {
-//       return res.status(404).json({
-//         success: false,
-//         message: "Visitor not found",
-//       });
-//     }
-
-//     console.log("👤 Visitor found:", visitor.visitorName);
-//     console.log("🆔 ID Number:", visitor.idNumber || "(empty)");
-
-//     if (!visitor.idNumber || visitor.idNumber.trim() === "") {
-//       return res.status(404).json({
-//         success: false,
-//         message: "No ID/asset assigned to this visitor.",
-//         suggestion:
-//           "Use PUT /api/IDVisitor/visitors/:id/cabinet with { 'idNumber': 'Tag1' }",
-//         visitor: {
-//           id: visitor._id,
-//           name: visitor.visitorName,
-//           company: visitor.company,
-//           currentIdNumber: visitor.idNumber || "Not assigned",
-//         },
-//       });
-//     }
-
-//     console.log("📡 Fetching asset locations from Mist API...");
-//     let assets;
-//     try {
-//       assets = await fetchAssetLocations();
-//     } catch (error) {
-//       console.error("❌ Mist API Error:", error.message);
-//       return res.status(500).json({
-//         success: false,
-//         message: "Failed to fetch asset locations from Mist API",
-//         error: error.message,
-//       });
-//     }
-
-//     const assetNames = assets
-//       .map((a) => a.raw?.name || a.name)
-//       .filter((name) => name);
-//     console.log("📋 Available assets:", assetNames.join(", "));
-
-//     const matchedAsset = assets.find((asset) => {
-//       const rawData = asset.raw || asset;
-//       return (
-//         rawData.name === visitor.idNumber || rawData.mac === visitor.idNumber
-//       );
-//     });
-
-//     if (!matchedAsset) {
-//       return res.status(404).json({
-//         success: false,
-//         message: `Asset "${visitor.idNumber}" not found in Mist system`,
-//         available_assets: assetNames,
-//         suggestion:
-//           "Make sure the idNumber matches an asset name in Mist. Available assets: " +
-//           assetNames.join(", "),
-//       });
-//     }
-
-//     const rawData = matchedAsset.raw || matchedAsset;
-
-//     console.log("✅ Asset found:", rawData.name);
-
-//     if (!rawData.x || !rawData.y) {
-//       return res.status(404).json({
-//         success: false,
-//         message: `Asset "${rawData.name}" found but has no location data`,
-//         data: {
-//           name: rawData.name,
-//           mac: rawData.mac,
-//           last_seen: rawData.last_seen,
-//           has_location: false,
-//         },
-//       });
-//     }
-
-//     let mapDetails = null;
-//     let wayfindingPath = null;
-//     let nearestNode = null;
-//     let routeToDestination = null;
-
-//     if (rawData.map_id) {
-//       try {
-//         mapDetails = await fetchMapDetails(rawData.map_id);
-
-//         if (includePath === "true") {
-//           wayfindingPath = await fetchWayfindingPath(rawData.map_id);
-
-//           if (
-//             wayfindingPath &&
-//             wayfindingPath.nodes &&
-//             wayfindingPath.nodes.length > 0
-//           ) {
-//             const targetX = 5525.298750495607;
-//             const targetY = 2491.837930104785;
-
-//             nearestNode = findNearestNode(wayfindingPath, rawData.x, rawData.y);
-//             const destNode = findNearestNode(wayfindingPath, targetX, targetY);
-
-//             if (nearestNode && nearestNode.node && destNode && destNode.node) {
-//               routeToDestination = findRoute(
-//                 wayfindingPath,
-//                 nearestNode.node.name,
-//                 destNode.node.name,
-//               );
-//             }
-//           }
-//         }
-//       } catch (error) {
-//         console.warn("⚠️ Could not fetch wayfinding data:", error.message);
-//       }
-//     }
-
-//     const targetX = 5525.298750495607;
-//     const targetY = 2491.837930104785;
-
-//     // ============================================================
-//     // ✅ SINGLE SOURCE OF TRUTH: Use Smoothed Position in METERS
-//     // ============================================================
-
-//     // 1. Get the smoothed position in meters (from AssetTracker)
-//     const smoothedPos = matchedAsset.position || {
-//       x_m: (rawData.x - MAP_CONFIGS[rawData.map_id]?.origin_x || 306.45106507695385) / (MAP_CONFIGS[rawData.map_id]?.ppm || 50.07391564392213),
-//       y_m: (MAP_CONFIGS[rawData.map_id]?.origin_y || 3856.483584010582 - rawData.y) / (MAP_CONFIGS[rawData.map_id]?.ppm || 50.07391564392213),
-//     };
-
-//     // Get PPM from map config
-//     let ppm = 50.07391564392213; // Default PPM
-//     if (rawData.map_id && MAP_CONFIGS[rawData.map_id]) {
-//       ppm = MAP_CONFIGS[rawData.map_id].ppm;
-//     }
-
-//     // 2. The smoothed position in meters (SINGLE SOURCE OF TRUTH)
-//     const x_m = smoothedPos.x_m; // e.g. 103.418
-//     const y_m = smoothedPos.y_m; // e.g. 49.640
-
-//     console.log(`📏 Smoothed Position (meters): x_m=${x_m}, y_m=${y_m}`);
-
-//     // 3. Calculate distance in METERS (not pixels)
-//     // Convert target from pixels to meters
-//     const targetX_m = targetX / ppm;
-//     const targetY_m = targetY / ppm;
-
-//     // Calculate distance in METERS
-//     const dx_m = targetX_m - x_m;
-//     const dy_m = targetY_m - y_m;
-//     const distanceMeters = Math.sqrt(dx_m * dx_m + dy_m * dy_m);
-
-//     // Calculate distance in pixels (for reference only)
-//     const distancePixels = distanceMeters * ppm;
-
-//     console.log(`📏 Distance: ${distancePixels.toFixed(2)} pixels = ${distanceMeters.toFixed(2)} meters`);
-
-//     // 4. Proximity based on METERS
-//     const proximityStatus =
-//       distanceMeters < 2
-//         ? "Very Close"
-//         : distanceMeters < 5
-//           ? "Close"
-//           : distanceMeters < 10
-//             ? "Moderate"
-//             : distanceMeters < 20
-//               ? "Medium"
-//               : "Far";
-
-//     // 5. Derive 3D World Coordinates (MUST equal x_m / y_m)
-//     const worldCoordinates = {
-//       x: x_m,    // MUST equal x_m
-//       z: y_m,    // MUST equal y_m
-//       y: 0.1     // Height off floor
-//     };
-
-//     // 6. Derive 2D Pixel Coordinates (with optional map offset)
-//     const MAP_OFFSET_X_M = 0; // Add your floor plan offset if needed
-//     const MAP_OFFSET_Y_M = 0; // Add your floor plan offset if needed
-
-//     const pixelX = (x_m + MAP_OFFSET_X_M) * ppm;
-//     const pixelY = (y_m + MAP_OFFSET_Y_M) * ppm;
-
-//     const stability = matchedAsset.stability || 1.0;
-//     const isStable = stability > 0.7;
-//     const beamAngle =
-//       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
-
-//     // ============================================================
-//     // ✅ RESPONSE DATA (All distances in METERS)
-//     // ============================================================
-
-//     const locationData = {
-//       visitor: {
-//         id: visitor._id,
-//         name: visitor.visitorName,
-//         phone: visitor.phoneNumber,
-//         email: visitor.email,
-//         company: visitor.company,
-//         idNumber: visitor.idNumber,
-//         purpose: visitor.purpose,
-//         checkedIn: visitor.checkedIn,
-//         checkedInAt: visitor.checkedInAt,
-//         qrExpiresAt: visitor.qrExpiresAt,
-//       },
-//       location: {
-//         x: rawData.x,
-//         y: rawData.y,
-//         name: rawData.name,
-//         mac: rawData.mac,
-//         map_id: rawData.map_id,
-//         ap_mac: rawData.ap_mac,
-//         last_seen: rawData.last_seen,
-//         rssi: rawData.rssi,
-//         beam: rawData.beam,
-//         beam_angle: beamAngle,
-//         device_name: rawData.device_name,
-//         manufacture: rawData.manufacture,
-//         stability: stability,
-//         is_stable: isStable,
-//         // SINGLE SOURCE OF TRUTH: Smoothed position in meters
-//         smoothed_position: {
-//           x_m: x_m,
-//           y_m: y_m,
-//           ppm: ppm,
-//           mapId: rawData.map_id,
-//         },
-//         // Pixel coordinates (derived from meters)
-//         pixel_coordinates: {
-//           x: pixelX,
-//           y: pixelY,
-//         },
-//         ap_history: matchedAsset.apHistory || [],
-//         // 3D World Coordinates (MUST equal x_m / y_m)
-//         world_coordinates: worldCoordinates,
-//       },
-//       map: mapDetails
-//         ? {
-//             id: mapDetails.id,
-//             name: mapDetails.name,
-//             width: mapDetails.width,
-//             height: mapDetails.height,
-//             ppm: mapDetails.ppm,
-//             origin_x: mapDetails.origin_x,
-//             origin_y: mapDetails.origin_y,
-//             orientation: mapDetails.orientation,
-//             width_m: mapDetails.width_m,
-//             height_m: mapDetails.height_m,
-//           }
-//         : null,
-//       target_coordinates: {
-//         x: targetX,
-//         y: targetY,
-//         x_m: targetX_m,
-//         y_m: targetY_m,
-//       },
-//       // ✅ DISTANCE IN METERS (Primary)
-//       distance: {
-//         meters: distanceMeters,
-//         pixels: distancePixels, // For reference only
-//       },
-//       proximity: proximityStatus,
-//       timestamp: new Date().toISOString(),
-//     };
-
-//     if (wayfindingPath && includePath === "true") {
-//       locationData.wayfinding = {
-//         total_nodes: wayfindingPath.nodes.length,
-//         total_edges: Object.keys(wayfindingPath.edges || {}).length,
-//         nearest_node: nearestNode
-//           ? {
-//               name: nearestNode.node.name,
-//               position: nearestNode.node.position,
-//               distance_pixels: nearestNode.distance,
-//               is_on_path: nearestNode.isOnPath,
-//             }
-//           : null,
-//         route_to_destination: routeToDestination
-//           ? {
-//               path: routeToDestination.path,
-//               segments: routeToDestination.segments,
-//               nodes: routeToDestination.nodes.map((node) => ({
-//                 name: node.name,
-//                 position: node.position,
-//               })),
-//             }
-//           : null,
-//         nodes: wayfindingPath.nodes.map((node) => ({
-//           name: node.name,
-//           position: node.position,
-//           edges: node.edges || {},
-//           worldPosition: convertMistToWorld(
-//             node.position.x,
-//             node.position.y,
-//             mapDetails,
-//           ),
-//         })),
-//         edges: wayfindingPath.edges,
-//       };
-//     }
-
-//     res.status(200).json({
-//       success: true,
-//       message: "Visitor location retrieved successfully",
-//       data: locationData,
-//     });
-//   } catch (error) {
-//     console.error("❌ Error fetching visitor location:", error);
-//     res.status(500).json({
-//       success: false,
-//       message: "Error fetching visitor location",
-//       error: error.message,
-//       stack: process.env.NODE_ENV === "development" ? error.stack : undefined,
-//     });
-//   }
-// };
 exports.getVisitorRoute = async (req, res) => {
   try {
     const { id } = req.params;
@@ -1307,22 +434,38 @@ exports.getVisitorRoute = async (req, res) => {
     }
 
     const rawData = matchedAsset.raw || matchedAsset;
+    const smoothedPos = matchedAsset.position; // from AssetTracker
 
-    console.log("✅ Asset found:", rawData.name);
+    console.log("✅ Asset found:", rawData.mac || rawData.name);
 
-    if (!rawData.x || !rawData.y) {
+    // ---- ALWAYS USE SMOOTHED POSITION (if available) ----
+    let assetX, assetY;
+    let usedSmoothed = false;
+
+    if (
+      smoothedPos &&
+      smoothedPos.x_m !== undefined &&
+      smoothedPos.y_m !== undefined
+    ) {
+      // Convert meters to pixels using ppm from map config
+      const ppm = MAP_CONFIGS[rawData.map_id]?.ppm || 50.07391564392213;
+      assetX = smoothedPos.x_m * ppm;
+      assetY = smoothedPos.y_m * ppm;
+      usedSmoothed = true;
+      console.log(`📍 Using smoothed position: (${assetX}, ${assetY})`);
+    } else if (rawData.x !== undefined && rawData.y !== undefined) {
+      assetX = rawData.x;
+      assetY = rawData.y;
+      console.log(`📍 Using raw position: (${assetX}, ${assetY})`);
+    } else {
       return res.status(404).json({
         success: false,
-        message: `Asset "${rawData.name}" found but has no location data`,
-        data: {
-          name: rawData.name,
-          mac: rawData.mac,
-          last_seen: rawData.last_seen,
-          has_location: false,
-        },
+        message: `Asset "${rawData.mac || rawData.name}" has no location data`,
+        data: { mac: rawData.mac, name: rawData.name, has_location: false },
       });
     }
 
+    // Now assetX and assetY are valid pixel coordinates
     let mapDetails = null;
     let wayfindingPath = null;
     let nearestNode = null;
@@ -1343,7 +486,7 @@ exports.getVisitorRoute = async (req, res) => {
             const targetX = 5525.298750495607;
             const targetY = 2491.837930104785;
 
-            nearestNode = findNearestNode(wayfindingPath, rawData.x, rawData.y);
+            nearestNode = findNearestNode(wayfindingPath, assetX, assetY);
             const destNode = findNearestNode(wayfindingPath, targetX, targetY);
 
             if (nearestNode && nearestNode.node && destNode && destNode.node) {
@@ -1363,85 +506,52 @@ exports.getVisitorRoute = async (req, res) => {
     const targetX = 5525.298750495607;
     const targetY = 2491.837930104785;
 
-    // ============================================================
-    // ✅ SINGLE SOURCE OF TRUTH: Use Smoothed Position in METERS
-    // ============================================================
-
-    // 1. Get the smoothed position in meters (from AssetTracker)
-    const smoothedPos = matchedAsset.position || {
-      x_m:
-        (rawData.x - MAP_CONFIGS[rawData.map_id]?.origin_x ||
-          306.45106507695385) /
-        (MAP_CONFIGS[rawData.map_id]?.ppm || 50.07391564392213),
-      y_m:
-        (MAP_CONFIGS[rawData.map_id]?.origin_y ||
-          3856.483584010582 - rawData.y) /
-        (MAP_CONFIGS[rawData.map_id]?.ppm || 50.07391564392213),
-    };
-
     // Get PPM from map config
     let ppm = 50.07391564392213; // Default PPM
     if (rawData.map_id && MAP_CONFIGS[rawData.map_id]) {
       ppm = MAP_CONFIGS[rawData.map_id].ppm;
     }
 
-    // 2. The smoothed position in meters (SINGLE SOURCE OF TRUTH)
-    const x_m = smoothedPos.x_m; // e.g. 103.418
-    const y_m = smoothedPos.y_m; // e.g. 49.640
+    // Calculate distance in pixels
+    const distancePixels =
+      assetX && assetY
+        ? Math.sqrt(
+            Math.pow(assetX - targetX, 2) + Math.pow(assetY - targetY, 2),
+          )
+        : null;
 
-    console.log(`📏 Smoothed Position (meters): x_m=${x_m}, y_m=${y_m}`);
-
-    // 3. Calculate distance in METERS (not pixels)
-    // Convert target from pixels to meters
-    const targetX_m = targetX / ppm;
-    const targetY_m = targetY / ppm;
-
-    // Calculate distance in METERS
-    const dx_m = targetX_m - x_m;
-    const dy_m = targetY_m - y_m;
-    const distanceMeters = Math.sqrt(dx_m * dx_m + dy_m * dy_m);
-
-    // Calculate distance in pixels (for reference only)
-    const distancePixels = distanceMeters * ppm;
+    // Convert to METERS
+    const distanceMeters =
+      distancePixels !== null ? distancePixels / ppm : null;
 
     console.log(
-      `📏 Distance: ${distancePixels.toFixed(2)} pixels = ${distanceMeters.toFixed(2)} meters`,
+      `📏 Distance: ${distancePixels?.toFixed(2)} pixels = ${distanceMeters?.toFixed(2)} meters`,
     );
 
-    // 4. Proximity based on METERS
     const proximityStatus =
-      distanceMeters < 2
-        ? "Very Close"
-        : distanceMeters < 5
-          ? "Close"
-          : distanceMeters < 10
-            ? "Moderate"
-            : distanceMeters < 20
-              ? "Medium"
-              : "Far";
-
-    // 5. Derive 3D World Coordinates (MUST equal x_m / y_m)
-    const worldCoordinates = {
-      x: x_m, // MUST equal x_m
-      z: y_m, // MUST equal y_m
-      y: 0.1, // Height off floor
-    };
-
-    // 6. Derive 2D Pixel Coordinates (with optional map offset)
-    const MAP_OFFSET_X_M = 0; // Add your floor plan offset if needed
-    const MAP_OFFSET_Y_M = 0; // Add your floor plan offset if needed
-
-    const pixelX = (x_m + MAP_OFFSET_X_M) * ppm;
-    const pixelY = (y_m + MAP_OFFSET_Y_M) * ppm;
+      distanceMeters !== null
+        ? distanceMeters < 2
+          ? "Very Close"
+          : distanceMeters < 5
+            ? "Close"
+            : distanceMeters < 10
+              ? "Moderate"
+              : distanceMeters < 20
+                ? "Medium"
+                : "Far"
+        : "Unknown";
 
     const stability = matchedAsset.stability || 1.0;
     const isStable = stability > 0.7;
     const beamAngle =
       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
 
-    // ============================================================
-    // ✅ RESPONSE DATA (All distances in METERS)
-    // ============================================================
+    // 3D World Coordinates (in meters)
+    const worldCoordinates = {
+      x: smoothedPos ? smoothedPos.x_m : assetX / ppm,
+      z: smoothedPos ? smoothedPos.y_m : assetY / ppm,
+      y: 0.1,
+    };
 
     const locationData = {
       visitor: {
@@ -1457,8 +567,8 @@ exports.getVisitorRoute = async (req, res) => {
         qrExpiresAt: visitor.qrExpiresAt,
       },
       location: {
-        x: rawData.x,
-        y: rawData.y,
+        x: assetX,
+        y: assetY,
         name: rawData.name,
         mac: rawData.mac,
         map_id: rawData.map_id,
@@ -1471,20 +581,13 @@ exports.getVisitorRoute = async (req, res) => {
         manufacture: rawData.manufacture,
         stability: stability,
         is_stable: isStable,
-        // SINGLE SOURCE OF TRUTH: Smoothed position in meters
-        smoothed_position: {
-          x_m: x_m,
-          y_m: y_m,
-          ppm: ppm,
-          mapId: rawData.map_id,
-        },
-        // Pixel coordinates (derived from meters)
+        used_smoothed: usedSmoothed,
+        smoothed_position: matchedAsset.position || null,
         pixel_coordinates: {
-          x: pixelX,
-          y: pixelY,
+          x: assetX,
+          y: assetY,
         },
         ap_history: matchedAsset.apHistory || [],
-        // 3D World Coordinates (MUST equal x_m / y_m)
         world_coordinates: worldCoordinates,
       },
       map: mapDetails
@@ -1504,13 +607,12 @@ exports.getVisitorRoute = async (req, res) => {
       target_coordinates: {
         x: targetX,
         y: targetY,
-        x_m: targetX_m,
-        y_m: targetY_m,
+        x_m: targetX / ppm,
+        y_m: targetY / ppm,
       },
-      // ✅ DISTANCE IN METERS (Primary)
       distance: {
+        pixels: distancePixels,
         meters: distanceMeters,
-        pixels: distancePixels, // For reference only
       },
       proximity: proximityStatus,
       timestamp: new Date().toISOString(),
@@ -1567,6 +669,7 @@ exports.getVisitorRoute = async (req, res) => {
     });
   }
 };
+
 // ============================
 // GET WAYFINDING PATH ONLY
 // ============================
@@ -1574,7 +677,6 @@ exports.getVisitorRoute = async (req, res) => {
 exports.getWayfindingPath = async (req, res) => {
   try {
     const { mapId } = req.params;
-
     if (!mapId) {
       return res.status(400).json({
         success: false,
@@ -1583,9 +685,7 @@ exports.getWayfindingPath = async (req, res) => {
     }
 
     console.log("🗺️ Fetching wayfinding path for map:", mapId);
-
     const mapDetails = await fetchMapDetails(mapId);
-
     if (!mapDetails) {
       return res.status(404).json({
         success: false,
@@ -1595,7 +695,6 @@ exports.getWayfindingPath = async (req, res) => {
     }
 
     const wayfindingPath = await fetchWayfindingPath(mapId);
-
     if (
       !wayfindingPath ||
       !wayfindingPath.nodes ||
@@ -1813,10 +912,8 @@ exports.getNavigationRoute = async (req, res) => {
 exports.getAllAssetLocations = async (req, res) => {
   try {
     console.log("📍 Fetching all asset locations...");
-
     const assets = await fetchAssetLocations();
 
-    // Format with enhanced data
     const formattedAssets = assets.map((asset) => {
       const rawData = asset.raw || asset;
       return {
@@ -1843,7 +940,6 @@ exports.getAllAssetLocations = async (req, res) => {
     });
 
     console.log(`✅ Found ${formattedAssets.length} assets with location data`);
-
     res.status(200).json({
       success: true,
       total: formattedAssets.length,
@@ -1866,7 +962,6 @@ exports.getAllAssetLocations = async (req, res) => {
 exports.getMapDetails = async (req, res) => {
   try {
     const { mapId } = req.params;
-
     if (!mapId) {
       return res.status(400).json({
         success: false,
@@ -1875,9 +970,7 @@ exports.getMapDetails = async (req, res) => {
     }
 
     console.log("📍 Fetching map details for ID:", mapId);
-
     const mapDetails = await fetchMapDetails(mapId);
-
     if (!mapDetails) {
       return res.status(404).json({
         success: false,
@@ -1942,7 +1035,6 @@ exports.getAssetTrackingState = async (req, res) => {
 exports.resetAssetTracking = async (req, res) => {
   try {
     const { mac } = req.params;
-
     if (!mac) {
       return res.status(400).json({
         success: false,
@@ -1951,7 +1043,6 @@ exports.resetAssetTracking = async (req, res) => {
     }
 
     AssetTracker.resetAsset(mac);
-
     res.status(200).json({
       success: true,
       message: `Asset tracking reset for ${mac}`,
@@ -1973,7 +1064,6 @@ exports.resetAssetTracking = async (req, res) => {
 exports.getVisitorCabinet = async (req, res) => {
   try {
     const { id } = req.params;
-
     if (!mongoose.Types.ObjectId.isValid(id)) {
       return res.status(400).json({
         success: false,
@@ -1982,7 +1072,6 @@ exports.getVisitorCabinet = async (req, res) => {
     }
 
     const visitor = await QRModel.findById(id);
-
     if (!visitor) {
       return res.status(404).json({
         success: false,
@@ -1999,7 +1088,6 @@ exports.getVisitorCabinet = async (req, res) => {
     }
 
     const assets = await fetchAssetLocations();
-
     const cabinet = assets.find((asset) => {
       const rawData = asset.raw || asset;
       return (
@@ -2018,7 +1106,6 @@ exports.getVisitorCabinet = async (req, res) => {
     }
 
     const rawData = cabinet.raw || cabinet;
-
     let mapDetails = null;
     if (rawData.map_id) {
       mapDetails = await fetchMapDetails(rawData.map_id);
@@ -2069,7 +1156,7 @@ exports.getVisitorCabinet = async (req, res) => {
 };
 
 // ============================
-// UPDATE VISITOR CABINET
+// UPDATE VISITOR CABINET (Enhanced with asset validation)
 // ============================
 
 exports.updateVisitorCabinet = async (req, res) => {
@@ -2092,7 +1179,6 @@ exports.updateVisitorCabinet = async (req, res) => {
     }
 
     const visitor = await QRModel.findById(id);
-
     if (!visitor) {
       return res.status(404).json({
         success: false,
@@ -2102,6 +1188,7 @@ exports.updateVisitorCabinet = async (req, res) => {
 
     const newIdNumber = idNumber || assetName;
 
+    // Verify asset exists in Mist (optional but recommended)
     try {
       const assets = await fetchAssetLocations();
       const assetExists = assets.some((asset) => {
@@ -2120,6 +1207,7 @@ exports.updateVisitorCabinet = async (req, res) => {
       }
     } catch (error) {
       console.warn("⚠️ Could not verify asset in Mist:", error.message);
+      // Proceed anyway – the location endpoint will fail if asset not found
     }
 
     visitor.idNumber = newIdNumber;
@@ -2169,7 +1257,6 @@ exports.testCoordinateConversion = async (req, res) => {
     }
 
     const mapData = await fetchMapDetails(mapId);
-
     if (!mapData) {
       return res.status(404).json({
         success: false,
@@ -2211,6 +1298,11 @@ exports.testCoordinateConversion = async (req, res) => {
     });
   }
 };
+
+// ============================
+// EXPORT ALL
+// ============================
+
 module.exports = {
   getVisitorRoute: exports.getVisitorRoute,
   getWayfindingPath: exports.getWayfindingPath,
