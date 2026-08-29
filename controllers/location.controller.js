@@ -415,47 +415,20 @@ exports.getVisitorRoute = async (req, res) => {
       .filter((name) => name);
     console.log("📋 Available assets:", assetNames.join(", "));
 
-    const visitorMacs = [
-      visitor.tagMac,
-      visitor.mistMacAddress,
-      visitor.idNumber,
-    ]
-      .filter(Boolean)
-      .map((s) => s.toLowerCase().trim());
-
-    const visitorNames = [
-      visitor.idNumber,
-      visitor.tagNickname,
-    ]
-      .filter(Boolean)
-      .map((s) => s.toLowerCase().trim());
-
     const matchedAsset = assets.find((asset) => {
       const rawData = asset.raw || asset;
-      const assetMac = (rawData.mac || asset.mac || "").toLowerCase().trim();
-      const assetName = (
-        rawData.name ||
-        rawData.device_name ||
-        asset.device_name ||
-        asset.name ||
-        ""
-      )
-        .toLowerCase()
-        .trim();
-
       return (
-        (assetMac && visitorMacs.includes(assetMac)) ||
-        (assetName && (visitorNames.includes(assetName) || visitorMacs.includes(assetName)))
+        rawData.name === visitor.idNumber || rawData.mac === visitor.idNumber
       );
     });
 
     if (!matchedAsset) {
       return res.status(404).json({
         success: false,
-        message: `Asset "${visitor.tagNickname || visitor.idNumber || visitor.tagMac}" not found in active Mist asset list`,
+        message: `Asset "${visitor.idNumber}" not found in Mist system`,
         available_assets: assetNames,
         suggestion:
-          "Ensure the BLE tag is powered on and within range of Mist APs. Available assets: " +
+          "Make sure the idNumber matches an asset name in Mist. Available assets: " +
           assetNames.join(", "),
       });
     }

@@ -430,7 +430,7 @@ class AssetTracker extends EventEmitter {
 
         // RSSI Floor
         if (primaryDet && primaryDet.rssi < this.MIN_RSSI) {
-          console.log(`📉 RSSI too weak (${primaryDet.rssi} dBm) – retaining last position for ${mac}`);
+          console.log(`📉 RSSI too weak (${primaryDet.rssi} dBm) – skipping position update for ${mac}`);
           state.apHistory.push({
             ap_mac: primaryAP.apMac,
             rssi: primaryAP.smoothedRssi,
@@ -440,23 +440,6 @@ class AssetTracker extends EventEmitter {
           });
           if (state.apHistory.length > 10) state.apHistory.shift();
           state.currentAP = { ap_mac: primaryAP.apMac, rssi: primaryAP.smoothedRssi, beam: primaryDet?.beam || null };
-
-          const pos = state.currentPosition || state.bestPosition;
-          if (pos) {
-            processedAssets.push({
-              mac,
-              device_name: state.device_name,
-              position: pos,
-              ap_mac: primaryAP.apMac,
-              rssi: primaryAP.smoothedRssi,
-              beam: primaryDet?.beam || null,
-              stability: state.stabilityScore,
-              map_id: state.map_id,
-              is_most_accurate: false,
-              best_rssi: state.bestRSSI,
-              ppm: pos.ppm || 50.0739,
-            });
-          }
           continue;
         }
 
@@ -579,22 +562,6 @@ class AssetTracker extends EventEmitter {
           const dist = this._distance(medX, medY, filteredX, filteredY);
           if (dist > this.OUTLIER_THRESHOLD) {
             console.log(`🛑 Outlier rejected for ${mac}: ${dist.toFixed(2)}m from median – keeping previous`);
-            const pos = state.currentPosition || state.bestPosition;
-            if (pos) {
-              processedAssets.push({
-                mac,
-                device_name: state.device_name,
-                position: pos,
-                ap_mac: primaryAP.apMac,
-                rssi: primaryAP.smoothedRssi,
-                beam: primaryDet?.beam || null,
-                stability: state.stabilityScore,
-                map_id: state.map_id,
-                is_most_accurate: state.positionStable,
-                best_rssi: state.bestRSSI,
-                ppm: pos.ppm || 50.0739,
-              });
-            }
             continue;
           }
         }
