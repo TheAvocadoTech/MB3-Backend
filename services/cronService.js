@@ -25,8 +25,12 @@ async function releaseAllTagsAndVisits() {
           tagMac: "",
           mistMacAddress: "",
           qrCode: "",
-          qrToken: null,
           visitEndedAt: new Date(),
+        },
+        $unset: {
+          qrToken: 1,
+          tempLoginToken: 1,
+          tempPasswordHash: 1,
         },
       },
     );
@@ -103,6 +107,14 @@ async function dropLegacyTTLIndexes() {
         console.log(
           `🛡️ [Database Protection] Dropped legacy TTL index "${idx.name}" from visitors collection.`,
         );
+      }
+      if (idx.name === "qrToken_1" && !idx.sparse) {
+        await QRModel.collection.dropIndex("qrToken_1").catch(() => {});
+        await QRModel.collection.createIndex(
+          { qrToken: 1 },
+          { unique: true, sparse: true },
+        ).catch(() => {});
+        console.log(`🛡️ [Database Protection] Recreated "qrToken_1" as sparse unique index.`);
       }
     }
   } catch (err) {

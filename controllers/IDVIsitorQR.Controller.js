@@ -746,28 +746,36 @@ exports.endVisit = async (req, res) => {
     }
 
     // Reset visit state on permanent visitor & invalidate QR code
-    visitor.isOnVisit = false;
-    visitor.checkedIn = false;
-    visitor.checkedOutAt = new Date();
-    visitor.visitEndedAt = new Date();
-    visitor.qrExpiresAt = new Date(); // Immediately expired upon ending visit
-    visitor.company = "";
-    visitor.idNumber = "";
-    visitor.tagId = null;
-    visitor.tagNickname = "";
-    visitor.tagMac = "";
-    visitor.mistMacAddress = "";
-    visitor.qrCode = "";
-    visitor.qrToken = null;
-    visitor.tempLoginToken = null;
-    visitor.tempPasswordHash = null;
-
-    await visitor.save();
+    const updatedVisitor = await QRModel.findByIdAndUpdate(
+      id,
+      {
+        $set: {
+          isOnVisit: false,
+          checkedIn: false,
+          checkedOutAt: new Date(),
+          visitEndedAt: new Date(),
+          qrExpiresAt: new Date(), // Immediately expired upon ending visit
+          company: "",
+          idNumber: "",
+          tagId: null,
+          tagNickname: "",
+          tagMac: "",
+          mistMacAddress: "",
+          qrCode: "",
+        },
+        $unset: {
+          qrToken: 1,
+          tempLoginToken: 1,
+          tempPasswordHash: 1,
+        },
+      },
+      { new: true }
+    );
 
     res.status(200).json({
       success: true,
       message: "Visit ended and tag freed successfully",
-      data: visitor,
+      data: updatedVisitor,
     });
   } catch (error) {
     console.error("Error ending visit:", error);
