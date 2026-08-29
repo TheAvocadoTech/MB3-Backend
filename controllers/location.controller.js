@@ -410,25 +410,33 @@ exports.getVisitorRoute = async (req, res) => {
       });
     }
 
+    const targetMac = (visitor.tagMac || visitor.mistMacAddress || "").toLowerCase().trim();
+    const targetIdNumber = (visitor.idNumber || "").toLowerCase().trim();
+    const targetNickname = (visitor.tagNickname || "").toLowerCase().trim();
+
     const assetNames = assets
-      .map((a) => a.raw?.name || a.name)
-      .filter((name) => name);
+      .map((a) => a.device_name || a.raw?.name || a.name || a.mac)
+      .filter(Boolean);
     console.log("📋 Available assets:", assetNames.join(", "));
 
     const matchedAsset = assets.find((asset) => {
-      const rawData = asset.raw || asset;
+      const aMac = (asset.mac || asset.raw?.mac || "").toLowerCase().trim();
+      const aName = (asset.device_name || asset.name || asset.raw?.name || "").toLowerCase().trim();
+
       return (
-        rawData.name === visitor.idNumber || rawData.mac === visitor.idNumber
+        (targetMac && aMac === targetMac) ||
+        (targetIdNumber && (aName === targetIdNumber || aMac === targetIdNumber)) ||
+        (targetNickname && aName === targetNickname)
       );
     });
 
     if (!matchedAsset) {
       return res.status(404).json({
         success: false,
-        message: `Asset "${visitor.idNumber}" not found in Mist system`,
+        message: `Asset "${visitor.tagMac || visitor.idNumber}" not found in Mist system`,
         available_assets: assetNames,
         suggestion:
-          "Make sure the idNumber matches an asset name in Mist. Available assets: " +
+          "Make sure the tagMac or idNumber matches an asset in Mist. Available assets: " +
           assetNames.join(", "),
       });
     }
@@ -436,11 +444,12 @@ exports.getVisitorRoute = async (req, res) => {
     const rawData = matchedAsset.raw || matchedAsset;
     const smoothedPos = matchedAsset.position; // from AssetTracker
 
-    console.log("✅ Asset found:", rawData.mac || rawData.name);
+    console.log("✅ Asset found:", rawData.mac || rawData.device_name || rawData.name);
 
     // ---- ALWAYS USE SMOOTHED POSITION (if available) ----
     let assetX, assetY;
     let usedSmoothed = false;
+    const currentMapId = matchedAsset.map_id || rawData.map_id || "30141417-44ea-4982-993c-6225c9f08315";
 
     if (
       smoothedPos &&
@@ -448,7 +457,7 @@ exports.getVisitorRoute = async (req, res) => {
       smoothedPos.y_m !== undefined
     ) {
       // Convert meters to pixels using ppm from map config
-      const ppm = MAP_CONFIGS[rawData.map_id]?.ppm || 50.07391564392213;
+      const ppm = MAP_CONFIGS[currentMapId]?.ppm || 50.07391564392213;
       assetX = smoothedPos.x_m * ppm;
       assetY = smoothedPos.y_m * ppm;
       usedSmoothed = true;
@@ -460,8 +469,8 @@ exports.getVisitorRoute = async (req, res) => {
     } else {
       return res.status(404).json({
         success: false,
-        message: `Asset "${rawData.mac || rawData.name}" has no location data`,
-        data: { mac: rawData.mac, name: rawData.name, has_location: false },
+        message: `Asset "${rawData.mac || rawData.device_name || rawData.name}" has no location data`,
+        data: { mac: rawData.mac, name: rawData.device_name || rawData.name, has_location: false },
       });
     }
 
@@ -471,12 +480,12 @@ exports.getVisitorRoute = async (req, res) => {
     let nearestNode = null;
     let routeToDestination = null;
 
-    if (rawData.map_id) {
+    if (currentMapId) {
       try {
-        mapDetails = await fetchMapDetails(rawData.map_id);
+        mapDetails = await fetchMapDetails(currentMapId);
 
         if (includePath === "true") {
-          wayfindingPath = await fetchWayfindingPath(rawData.map_id);
+          wayfindingPath = await fetchWayfindingPath(currentMapId);
 
           if (
             wayfindingPath &&
@@ -508,8 +517,8 @@ exports.getVisitorRoute = async (req, res) => {
 
     // Get PPM from map config
     let ppm = 50.07391564392213; // Default PPM
-    if (rawData.map_id && MAP_CONFIGS[rawData.map_id]) {
-      ppm = MAP_CONFIGS[rawData.map_id].ppm;
+    if (currentMapId && MAP_CONFIGS[currentMapId]) {
+      ppm = MAP_CONFIGS[currentMapId].ppm;
     }
 
     // Calculate distance in pixels
