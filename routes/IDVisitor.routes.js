@@ -45,11 +45,11 @@ router.post("/visitors/bulk", visitorController.bulkCreateVisitors);
 // Get all visitors with filters
 router.get("/visitors", visitorController.getAllVisitors);
 
+// Get visitor by QR token (must be before /:id)
+router.get("/visitors/token/:token", visitorController.getVisitorByToken);
+
 // Get single visitor by ID
 router.get("/visitors/:id", visitorController.getVisitorById);
-
-// Get visitor by QR token
-router.get("/visitors/token/:token", visitorController.getVisitorByToken);
 
 // ============================
 // VISIT OPERATIONS
@@ -136,10 +136,10 @@ router.get("/maps/:mapId/convert", locationController.testCoordinateConversion);
 // DELETE OPERATIONS
 // ============================
 
+// Bulk delete visitors (must be before /:id)
+router.delete("/visitors/bulk", visitorController.bulkDeleteVisitors);
+
 // Delete single visitor
 router.delete("/visitors/:id", visitorController.deleteVisitor);
-
-// Bulk delete visitors (expired/checked-in/all)
-router.delete("/visitors/bulk", visitorController.bulkDeleteVisitors);
 
 module.exports = router;
