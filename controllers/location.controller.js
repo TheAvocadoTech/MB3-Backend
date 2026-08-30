@@ -410,7 +410,9 @@ exports.getVisitorRoute = async (req, res) => {
       });
     }
 
-    const targetMac = (visitor.tagMac || visitor.mistMacAddress || "").toLowerCase().trim();
+    const targetMac = (visitor.tagMac || visitor.mistMacAddress || "")
+      .toLowerCase()
+      .trim();
     const targetIdNumber = (visitor.idNumber || "").toLowerCase().trim();
     const targetNickname = (visitor.tagNickname || "").toLowerCase().trim();
 
@@ -421,11 +423,14 @@ exports.getVisitorRoute = async (req, res) => {
 
     const matchedAsset = assets.find((asset) => {
       const aMac = (asset.mac || asset.raw?.mac || "").toLowerCase().trim();
-      const aName = (asset.device_name || asset.name || asset.raw?.name || "").toLowerCase().trim();
+      const aName = (asset.device_name || asset.name || asset.raw?.name || "")
+        .toLowerCase()
+        .trim();
 
       return (
         (targetMac && aMac === targetMac) ||
-        (targetIdNumber && (aName === targetIdNumber || aMac === targetIdNumber)) ||
+        (targetIdNumber &&
+          (aName === targetIdNumber || aMac === targetIdNumber)) ||
         (targetNickname && aName === targetNickname)
       );
     });
@@ -444,12 +449,18 @@ exports.getVisitorRoute = async (req, res) => {
     const rawData = matchedAsset.raw || matchedAsset;
     const smoothedPos = matchedAsset.position; // from AssetTracker
 
-    console.log("✅ Asset found:", rawData.mac || rawData.device_name || rawData.name);
+    console.log(
+      "✅ Asset found:",
+      rawData.mac || rawData.device_name || rawData.name,
+    );
 
     // ---- ALWAYS USE SMOOTHED POSITION (if available) ----
     let assetX, assetY;
     let usedSmoothed = false;
-    const currentMapId = matchedAsset.map_id || rawData.map_id || "30141417-44ea-4982-993c-6225c9f08315";
+    const currentMapId =
+      matchedAsset.map_id ||
+      rawData.map_id ||
+      "30141417-44ea-4982-993c-6225c9f08315";
 
     if (
       smoothedPos &&
@@ -470,7 +481,11 @@ exports.getVisitorRoute = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: `Asset "${rawData.mac || rawData.device_name || rawData.name}" has no location data`,
-        data: { mac: rawData.mac, name: rawData.device_name || rawData.name, has_location: false },
+        data: {
+          mac: rawData.mac,
+          name: rawData.device_name || rawData.name,
+          has_location: false,
+        },
       });
     }
 
@@ -492,8 +507,10 @@ exports.getVisitorRoute = async (req, res) => {
             wayfindingPath.nodes &&
             wayfindingPath.nodes.length > 0
           ) {
-            const targetX = 5525.298750495607;
-            const targetY = 2491.837930104785;
+            // const targetX = 5525.298750495607;
+            // const targetY = 2491.837930104785;
+            const targetX = 5625.298750495607;
+            const targetY = 2200.837930104785;
 
             nearestNode = findNearestNode(wayfindingPath, assetX, assetY);
             const destNode = findNearestNode(wayfindingPath, targetX, targetY);
@@ -512,8 +529,10 @@ exports.getVisitorRoute = async (req, res) => {
       }
     }
 
-    const targetX = 5525.298750495607;
-    const targetY = 2491.837930104785;
+    // const targetX = 5525.298750495607;
+    // const targetY = 2491.837930104785;
+    const targetX = 5625.298750495607;
+    const targetY = 2200.837930104785;
 
     // Get PPM from map config
     let ppm = 50.07391564392213; // Default PPM

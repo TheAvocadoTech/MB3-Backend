@@ -166,7 +166,10 @@ const getMidnightExpiryDate = () => {
     now.getFullYear(),
     now.getMonth(),
     now.getDate() + 1, // Next calendar day
-    0, 0, 0, 0         // Exactly 12:00:00.000 AM Midnight
+    0,
+    0,
+    0,
+    0, // Exactly 12:00:00.000 AM Midnight
   );
 };
 
@@ -263,7 +266,9 @@ const generateVisitorPDF = async (visitorData, qrCodeImage) => {
         .text(`  |  Valid Until: `, { continued: true })
         .font("Helvetica")
         .fillColor("#000")
-        .text(`${new Date(visitorData.qrExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} Midnight (or until visit ends)`)
+        .text(
+          `${new Date(visitorData.qrExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} Midnight (or until visit ends)`,
+        )
         .moveDown(0.5);
 
       doc
@@ -432,7 +437,7 @@ const sendVisitorPassEmail = async (visitor, qrCodeImage) => {
           <div style="background: #f9fafb; padding: 16px; border-radius: 8px; margin: 18px 0; border: 1px solid #f3f4f6;">
             <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>🏢 Visiting Company:</strong> ${visitor.company || "N/A"}</p>
             <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>🏷️ Assigned BLE Tag:</strong> ${visitor.tagNickname || visitor.idNumber || "BLE Tag"}</p>
-            <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>⏰ Valid Until:</strong> ${new Date(visitor.qrExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} Midnight (or until visit ends)</p>
+            <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>⏰ Valid Until:</strong> ${new Date(visitor.qrExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} Midnight (or until visit ends)</p>
           </div>
 
           <p style="color: #4b5563; font-size: 13.5px; line-height: 1.5;">
@@ -459,7 +464,10 @@ const sendVisitorPassEmail = async (visitor, qrCodeImage) => {
     visitor.pdfDownloadCount = (visitor.pdfDownloadCount || 0) + 1;
     console.log(`✉️ [Email Success] Visitor Pass sent to ${visitor.email}`);
   } catch (mailError) {
-    console.warn(`⚠️ [Email Warning] Could not send pass to ${visitor.email}:`, mailError.message);
+    console.warn(
+      `⚠️ [Email Warning] Could not send pass to ${visitor.email}:`,
+      mailError.message,
+    );
   }
 };
 
@@ -481,7 +489,8 @@ exports.createVisitor = async (req, res) => {
     if (!visitorName || !phoneNumber || !email) {
       return res.status(400).json({
         success: false,
-        message: "Missing required fields: visitorName, phoneNumber, and email are mandatory.",
+        message:
+          "Missing required fields: visitorName, phoneNumber, and email are mandatory.",
       });
     }
 
@@ -511,7 +520,10 @@ exports.createVisitor = async (req, res) => {
     }
 
     // If company and tag are provided, or explicit startVisit flag is true, start visit
-    if ((shouldStartVisit || (company && (tagId || idNumber))) && !visitor.isOnVisit) {
+    if (
+      (shouldStartVisit || (company && (tagId || idNumber))) &&
+      !visitor.isOnVisit
+    ) {
       let tag = null;
       if (tagId && mongoose.Types.ObjectId.isValid(tagId)) {
         tag = await IdManagement.findById(tagId);
@@ -527,7 +539,10 @@ exports.createVisitor = async (req, res) => {
       }
 
       if (tag) {
-        if (tag.status === "In Use" && String(tag.assignedVisitor) !== String(visitor._id)) {
+        if (
+          tag.status === "In Use" &&
+          String(tag.assignedVisitor) !== String(visitor._id)
+        ) {
           return res.status(400).json({
             success: false,
             message: `Tag "${tag.nickname}" (${tag.name}) is currently in use by another visitor.`,
@@ -644,7 +659,10 @@ exports.startVisit = async (req, res) => {
     }
 
     if (tag) {
-      if (tag.status === "In Use" && String(tag.assignedVisitor) !== String(visitor._id)) {
+      if (
+        tag.status === "In Use" &&
+        String(tag.assignedVisitor) !== String(visitor._id)
+      ) {
         return res.status(400).json({
           success: false,
           message: `Tag "${tag.nickname}" (${tag.name}) is currently in use by another visitor.`,
@@ -741,7 +759,7 @@ exports.endVisit = async (req, res) => {
           assignedVisitor: null,
           assignedVisitorName: "",
           assignedAt: null,
-        }
+        },
       );
     }
 
@@ -769,7 +787,7 @@ exports.endVisit = async (req, res) => {
           tempPasswordHash: 1,
         },
       },
-      { new: true }
+      { new: true },
     );
 
     res.status(200).json({
@@ -806,7 +824,10 @@ exports.bulkCreateVisitors = async (req, res) => {
       const data = visitorsData[i];
       try {
         if (!data.visitorName || !data.phoneNumber) {
-          errors.push({ index: i, error: "Missing visitorName or phoneNumber" });
+          errors.push({
+            index: i,
+            error: "Missing visitorName or phoneNumber",
+          });
           continue;
         }
 
@@ -866,7 +887,11 @@ exports.getAllVisitors = async (req, res) => {
 
     let filter = {};
 
-    if (onVisitOnly === "true" || status === "onVisit" || status === "on_visit") {
+    if (
+      onVisitOnly === "true" ||
+      status === "onVisit" ||
+      status === "on_visit"
+    ) {
       filter.isOnVisit = true;
     } else if (status === "idle" || status === "inactive") {
       filter.isOnVisit = false;
@@ -965,7 +990,8 @@ exports.getVisitorByToken = async (req, res) => {
     if (!visitor) {
       return res.status(404).json({
         success: false,
-        message: "Invalid or expired QR token (valid only until 12:00 AM midnight or until visit ends)",
+        message:
+          "Invalid or expired QR token (valid only until 12:00 AM midnight or until visit ends)",
       });
     }
 
@@ -1038,7 +1064,7 @@ exports.sendQR = async (req, res) => {
           <div style="background: #f9fafb; padding: 16px; border-radius: 8px; margin: 18px 0; border: 1px solid #f3f4f6;">
             <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>🏢 Visiting Company:</strong> ${visitor.company || "N/A"}</p>
             <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>🏷️ Assigned BLE Tag:</strong> ${visitor.tagNickname || visitor.idNumber || "BLE Tag"}</p>
-            <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>⏰ Valid Until:</strong> ${new Date(visitor.qrExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} Midnight (or until visit ends)</p>
+            <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>⏰ Valid Until:</strong> ${new Date(visitor.qrExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} Midnight (or until visit ends)</p>
           </div>
 
           <p style="color: #4b5563; font-size: 13.5px; line-height: 1.5;">
@@ -1139,7 +1165,7 @@ exports.resendQR = async (req, res) => {
           <div style="background: #f9fafb; padding: 16px; border-radius: 8px; margin: 18px 0; border: 1px solid #f3f4f6;">
             <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>🏢 Visiting Company:</strong> ${visitor.company || "N/A"}</p>
             <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>🏷️ Assigned BLE Tag:</strong> ${visitor.tagNickname || visitor.idNumber || "BLE Tag"}</p>
-            <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>⏰ Valid Until:</strong> ${new Date(visitor.qrExpiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} Midnight (or until visit ends)</p>
+            <p style="margin: 5px 0; font-size: 13.5px; color: #1f2937;"><strong>⏰ Valid Until:</strong> ${new Date(visitor.qrExpiresAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })} Midnight (or until visit ends)</p>
           </div>
 
           <p style="color: #4b5563; font-size: 13.5px; line-height: 1.5;">
