@@ -1,5 +1,6 @@
 // services/mistAssetTracker.js
-// Full Mist asset tracker:
+// Full Mist asset tracker with dynamic position trail (breadcrumb path).
+//
 //   - Mist API polling (with 429 backoff) + caching
 //   - Local AP list from ap_list.json + AP_CORRECTIONS
 //   - Per-AP RSSI offset + AoA vector rotation + static-anchor pinning
@@ -7,9 +8,9 @@
 //   - Particle filter (or EMA fallback)
 //   - Median outlier rejection
 //   - Heatmap density smoothing
-//   - Wayfinding map matching
 //   - Velocity limiting + jump guard
 //   - Stationary Drift Guard (dead-zone lock + adaptive alpha)
+//   - Dynamic position trail (replaces wayfinding-path snapping)
 //
 // Exports a singleton EventEmitter.
 
@@ -37,56 +38,39 @@ const mist = axios.create({
 
 // ============================================================
 // MAP CONFIGURATIONS
-// ppm = pixels per meter. Mist uses Y-down, we flip to Y-up (meters).
 // ============================================================
 const MAP_CONFIGS = {
   "30141417-44ea-4982-993c-6225c9f08315": {
     name: "MB3-F00",
-    width: 6400,
-    height: 5120,
+    width: 6400, height: 5120,
     width_m: 127.81105527098556,
     height_m: 102.24884421678846,
     origin_x: 306.45106507695385,
     origin_y: 3856.483584010582,
     ppm: 50.07391564392213,
-    offset_x: 0,
-    offset_y: 0,
+    offset_x: 0, offset_y: 0,
   },
   "cfa55e13-794f-4081-b1b7-e35f1ea67325": {
     name: "MB3-F01",
-    width: 6400,
-    height: 5120,
+    width: 6400, height: 5120,
     width_m: 111.74050632911398,
     height_m: 89.39240506329119,
     origin_x: 6.786923314266026,
     origin_y: 4134.933029216576,
     ppm: 57.275559331634064,
-    offset_x: 0,
-    offset_y: 0,
+    offset_x: 0, offset_y: 0,
   },
   default: {
     name: "default",
-    width: 6400,
-    height: 5120,
-    width_m: 50,
-    height_m: 50,
-    origin_x: 0,
-    origin_y: 0,
-    ppm: 10,
-    offset_x: 0,
-    offset_y: 0,
+    width: 6400, height: 5120,
+    width_m: 50, height_m: 50,
+    origin_x: 0, origin_y: 0, ppm: 10,
+    offset_x: 0, offset_y: 0,
   },
 };
 
 // ============================================================
-// WAYFINDING DATA (per map_id)
-// ============================================================
-const WAYFINDING_DATA = new Map();
-
-// ============================================================
 // AP CORRECTIONS
-// Local overrides keyed by AP MAC. Tells the tracker about
-// rotated AoA vectors, RSSI bias, and static-zone anchors.
 // ============================================================
 const AP_CORRECTIONS = {
   c878678aa2ab: {
@@ -109,7 +93,6 @@ class ParticleFilter {
     this.weights = [];
     this.initialized = false;
   }
-
   init(x, y) {
     this.particles = [];
     this.weights = [];
@@ -122,7 +105,6 @@ class ParticleFilter {
     }
     this.initialized = true;
   }
-
   predict(dt) {
     const noise = this.processNoise * Math.sqrt(dt || 1);
     for (let i = 0; i < this.particles.length; i++) {
@@ -130,12 +112,11 @@ class ParticleFilter {
       this.particles[i].y += (Math.random() - 0.5) * noise * 2;
     }
   }
-
-  update(measurementX, measurementY) {
+  update(mx, my) {
     let totalWeight = 0;
     for (let i = 0; i < this.particles.length; i++) {
-      const dx = this.particles[i].x - measurementX;
-      const dy = this.particles[i].y - measurementY;
+      const dx = this.particles[i].x - mx;
+      const dy = this.particles[i].y - my;
       const dist = Math.sqrt(dx * dx + dy * dy);
       const weight = Math.exp(
         -(dist * dist) / (2 * this.measurementNoise * this.measurementNoise)
@@ -149,7 +130,6 @@ class ParticleFilter {
       }
     }
   }
-
   resample() {
     const newParticles = [];
     const cumulative = [];
@@ -169,12 +149,9 @@ class ParticleFilter {
     this.particles = newParticles;
     this.weights.fill(1 / this.numParticles);
   }
-
   getEstimate() {
     if (!this.initialized || this.particles.length === 0) return null;
-    let avgX = 0,
-      avgY = 0,
-      totalW = 0;
+    let avgX = 0, avgY = 0, totalW = 0;
     for (let i = 0; i < this.particles.length; i++) {
       avgX += this.particles[i].x * this.weights[i];
       avgY += this.particles[i].y * this.weights[i];
@@ -187,47 +164,28 @@ class ParticleFilter {
 
 // ============================================================
 // Stationary Drift Guard
-// Freezes reported position during jitter, adaptive smooths on movement.
 // ============================================================
 class StationaryDriftGuard {
-  /**
-   * @param {Object} state       Asset state (must contain `currentPosition`
-   *                             or `currentPos`)
-   * @param {number} candidateX  New candidate X (meters)
-   * @param {number} candidateY  New candidate Y (meters)
-   * @param {Object} cfg         { threshold, fastThreshold, stationaryAlpha, movingAlpha }
-   * @returns {{ x, y, isMoving }}
-   */
   static applyStationaryLock(state, candidateX, candidateY, cfg = {}) {
     const cur = state.currentPosition || state.currentPos;
-
     const threshold = cfg.threshold ?? cfg.lockDistanceThreshold ?? 0.80;
     const fastThreshold = cfg.fastThreshold ?? 1.5;
     const stationaryAlpha = cfg.stationaryAlpha ?? 0.02;
     const movingAlpha = cfg.movingAlpha ?? 0.45;
 
-    // No reference yet: accept candidate. "Moving" is a lie, but safer than
-    // telling the UI the tag is stationary forever on first tick.
-    if (!cur) {
-      return { x: candidateX, y: candidateY, isMoving: true };
-    }
+    if (!cur) return { x: candidateX, y: candidateY, isMoving: true };
 
     const cx = cur.x_m;
     const cy = cur.y_m;
-
     const distFromCurrent = Math.sqrt(
       (candidateX - cx) ** 2 + (candidateY - cy) ** 2
     );
 
-    // --- RULE 1: dead-zone lock ---
     if (distFromCurrent < threshold) {
       return { x: cx, y: cy, isMoving: false };
     }
 
-    // --- RULE 2: adaptive alpha ---
-    const alpha =
-      distFromCurrent > fastThreshold ? movingAlpha : stationaryAlpha;
-
+    const alpha = distFromCurrent > fastThreshold ? movingAlpha : stationaryAlpha;
     return {
       x: alpha * candidateX + (1 - alpha) * cx,
       y: alpha * candidateY + (1 - alpha) * cy,
@@ -268,8 +226,6 @@ class AssetTracker extends EventEmitter {
     this.MEASUREMENT_NOISE = options.measurementNoise ?? 1.0;
     this.USE_PARTICLE_FILTER = options.useParticleFilter ?? true;
     this.USE_HEATMAP = options.useHeatmap ?? true;
-    this.USE_MAP_MATCHING = options.useMapMatching ?? true;
-    this.MAP_MATCH_THRESHOLD = options.mapMatchThreshold ?? 3.0;
 
     // --- AP correction / static-anchor pinning ---
     this.STRONG_RSSI_PIN_DB = options.strongRssiPinDb ?? -62;
@@ -284,6 +240,13 @@ class AssetTracker extends EventEmitter {
       movingAlpha: options.movingAlpha ?? 0.45,
       ...(options.stationaryCfg || {}),
     };
+
+    // --- Dynamic path (breadcrumb trail) ---
+    this.USE_TRAIL = options.useTrail ?? true;
+    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;   // ~30s @ 10Hz
+    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;    // ignore jitter
+    this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000; // 5 min
+    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;  // cap emit size
 
     // --- Backoff / cache ---
     this.backoffUntil = 0;
@@ -365,6 +328,8 @@ class AssetTracker extends EventEmitter {
         device_name: state.device_name,
         position: state.currentPosition,
         position_px: positionPx,
+        trail: state.positionTrail ? [...state.positionTrail] : [],
+        trail_px: this._trailToPixels(state.positionTrail, state.map_id),
         best_position: state.bestPosition,
         best_rssi: state.bestRSSI,
         stability: state.stabilityScore,
@@ -382,11 +347,29 @@ class AssetTracker extends EventEmitter {
     return states;
   }
 
+  getAssetTrail(mac) {
+    const state = this.assetStates.get(mac);
+    if (!state || !state.positionTrail) return [];
+    return [...state.positionTrail];
+  }
+
+  clearAssetTrail(mac) {
+    const state = this.assetStates.get(mac);
+    if (state) state.positionTrail = [];
+  }
+
   resetAsset(mac) {
     this.assetStates.delete(mac);
     this.apRssiFilters.delete(mac);
     this.hysteresisCounters.delete(mac);
     this.positionHistory.delete(mac);
+  }
+
+  // Kept for backwards compat — no longer used internally
+  setWayfindingData() {
+    console.warn(
+      "⚠️ setWayfindingData() is deprecated — the tracker now builds the path dynamically from the tag's own trail."
+    );
   }
 
   // ============================================================
@@ -454,17 +437,6 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Wayfinding registration (nodes + edges per map)
-  // ============================================================
-  setWayfindingData(mapId, nodes, edges) {
-    if (!nodes || !edges) return;
-    WAYFINDING_DATA.set(mapId, { nodes, edges });
-    console.log(
-      `🗺️ Wayfinding data loaded for map ${mapId} (${nodes.length} nodes)`
-    );
-  }
-
-  // ============================================================
   // Preprocess a single AP detection (AoA correction only)
   // ============================================================
   _preprocessDetection(apMac, rawX, rawY, rawRssi) {
@@ -482,7 +454,6 @@ class AssetTracker extends EventEmitter {
       x = ap.x_m + (dx * Math.cos(rad) - dy * Math.sin(rad));
       y = ap.y_m + (dx * Math.sin(rad) + dy * Math.cos(rad));
     }
-
     return { x_m: x, y_m: y, correctedRssi };
   }
 
@@ -499,6 +470,45 @@ class AssetTracker extends EventEmitter {
       return { x: ap.x_m, y: ap.y_m };
     }
     return { x, y };
+  }
+
+  // ============================================================
+  // Trail helpers
+  // ============================================================
+  _appendToTrail(state, x_m, y_m, now) {
+    if (!this.USE_TRAIL) return;
+    if (!state.positionTrail) state.positionTrail = [];
+
+    const trail = state.positionTrail;
+    const last = trail[trail.length - 1];
+
+    // Only add a point if the tag actually moved enough
+    if (
+      last &&
+      this._distance(last.x_m, last.y_m, x_m, y_m) < this.TRAIL_MIN_MOVE_M
+    ) {
+      // Still update age-based cleanup below
+    } else {
+      trail.push({ x_m, y_m, t: now });
+    }
+
+    // Cap by count
+    while (trail.length > this.TRAIL_MAX_POINTS) trail.shift();
+
+    // Cap by age
+    const cutoff = now - this.TRAIL_MAX_AGE_MS;
+    while (trail.length > 0 && trail[0].t < cutoff) trail.shift();
+  }
+
+  _trailToPixels(trail, mapId) {
+    if (!trail || trail.length === 0) return [];
+    const cfg = MAP_CONFIGS[mapId];
+    if (!cfg) return trail.map((p) => ({ x: p.x_m, y: p.y_m, t: p.t }));
+    return trail.map((p) => ({
+      x: p.x_m * cfg.ppm + cfg.origin_x,
+      y: cfg.origin_y - p.y_m * cfg.ppm,
+      t: p.t,
+    }));
   }
 
   // ============================================================
@@ -546,6 +556,7 @@ class AssetTracker extends EventEmitter {
             heatmapPositions: [],
             particleFilter: null,
             isMoving: false,
+            positionTrail: [],   // <-- NEW
           };
           if (this.USE_PARTICLE_FILTER) {
             state.particleFilter = new ParticleFilter(
@@ -636,11 +647,8 @@ class AssetTracker extends EventEmitter {
 
         if (!primaryAP || !primaryAP.apMac) {
           state.apHistory.push({
-            ap_mac: null,
-            rssi: null,
-            beam: null,
-            timestamp: Date.now(),
-            is_most_accurate: false,
+            ap_mac: null, rssi: null, beam: null,
+            timestamp: Date.now(), is_most_accurate: false,
           });
           if (state.apHistory.length > 10) state.apHistory.shift();
           state.currentAP = null;
@@ -675,37 +683,28 @@ class AssetTracker extends EventEmitter {
           const apInfo = this.apMap.get(apMac);
 
           if (!apInfo) {
-            // No static AP position → use Mist AoA coords with rotation
             const coords = this._convertCoordinates(det.x, det.y, det.map_id);
             if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
               const pre = this._preprocessDetection(
-                apMac,
-                coords.x_m,
-                coords.y_m,
-                det.rssi
+                apMac, coords.x_m, coords.y_m, det.rssi
               );
               apPositions.push({
-                x_m: pre.x_m,
-                y_m: pre.y_m,
+                x_m: pre.x_m, y_m: pre.y_m,
                 weight: Math.pow(10, pre.correctedRssi / 10),
               });
             }
             continue;
           }
 
-          // Static AP position: just RSSI offset, no rotation
           const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
           apPositions.push({
-            x_m: apInfo.x_m,
-            y_m: apInfo.y_m,
+            x_m: apInfo.x_m, y_m: apInfo.y_m,
             weight: Math.pow(10, correctedRssi / 10),
           });
         }
 
         if (apPositions.length > 0) {
-          let sumX = 0,
-            sumY = 0,
-            sumW = 0;
+          let sumX = 0, sumY = 0, sumW = 0;
           for (const p of apPositions) {
             sumX += p.x_m * p.weight;
             sumY += p.y_m * p.weight;
@@ -717,12 +716,9 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ---- Fallback to top-AP centroid from Mist AoA ----
         if (measurementX === null || measurementY === null) {
           const topAps = sortedAPs.slice(0, this.TOP_APS);
-          let mX = 0,
-            mY = 0,
-            mW = 0;
+          let mX = 0, mY = 0, mW = 0;
           for (const { apMac, smoothedRssi } of topAps) {
             const det = detectionsMap.get(apMac);
             if (!det) continue;
@@ -730,10 +726,7 @@ class AssetTracker extends EventEmitter {
             if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
               continue;
             const pre = this._preprocessDetection(
-              apMac,
-              coords.x_m,
-              coords.y_m,
-              smoothedRssi
+              apMac, coords.x_m, coords.y_m, smoothedRssi
             );
             const w = Math.pow(10, pre.correctedRssi / 10);
             mX += pre.x_m * w;
@@ -754,7 +747,7 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ---- Static-anchor pin (reception AP) ----
+        // ---- Static-anchor pin ----
         {
           const pinned = this._applyStaticAnchorPin(
             primaryAP.apMac,
@@ -781,7 +774,7 @@ class AssetTracker extends EventEmitter {
           beam: primaryDet?.beam || null,
         };
 
-        // ---- Particle filter (or EMA fallback) ----
+        // ---- Particle filter / EMA ----
         let filteredX, filteredY;
         if (this.USE_PARTICLE_FILTER) {
           if (!state.particleFilter.initialized) {
@@ -815,7 +808,7 @@ class AssetTracker extends EventEmitter {
           filteredY = state.smoothedPos.y_m;
         }
 
-        // ---- Outlier rejection (median of recent history) ----
+        // ---- Outlier rejection ----
         if (!this.positionHistory.has(mac)) this.positionHistory.set(mac, []);
         const history = this.positionHistory.get(mac);
 
@@ -834,11 +827,7 @@ class AssetTracker extends EventEmitter {
             continue;
           }
         }
-        history.push({
-          x_m: filteredX,
-          y_m: filteredY,
-          timestamp: Date.now(),
-        });
+        history.push({ x_m: filteredX, y_m: filteredY, timestamp: Date.now() });
         if (history.length > this.MAX_HISTORY) history.shift();
 
         // ---- Heatmap density ----
@@ -847,9 +836,7 @@ class AssetTracker extends EventEmitter {
 
         if (this.USE_HEATMAP) {
           state.heatmapPositions.push({
-            x: filteredX,
-            y: filteredY,
-            t: Date.now(),
+            x: filteredX, y: filteredY, t: Date.now(),
           });
           if (state.heatmapPositions.length > this.HEATMAP_WINDOW) {
             state.heatmapPositions.shift();
@@ -863,14 +850,10 @@ class AssetTracker extends EventEmitter {
 
             for (let i = 0; i < points.length; i++) {
               let count = 0;
-              let sumX = 0;
-              let sumY = 0;
+              let sumX = 0, sumY = 0;
               for (let j = 0; j < points.length; j++) {
                 const dist = this._distance(
-                  points[i].x,
-                  points[i].y,
-                  points[j].x,
-                  points[j].y
+                  points[i].x, points[i].y, points[j].x, points[j].y
                 );
                 if (dist < this.HEATMAP_RADIUS) {
                   count++;
@@ -891,53 +874,7 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ---- Map matching against wayfinding edges ----
-        if (this.USE_MAP_MATCHING && state.map_id) {
-          const wayfinding = WAYFINDING_DATA.get(state.map_id);
-          if (wayfinding && wayfinding.edges) {
-            const { nodes, edges } = wayfinding;
-
-            let bestDist = Infinity;
-            let bestPoint = { x: finalX, y: finalY };
-            const edgeList = [];
-
-            for (const [src, targets] of Object.entries(edges)) {
-              const srcNode = nodes.find((n) => n.name === src);
-              if (!srcNode) continue;
-              for (const [tgt] of Object.entries(targets)) {
-                const tgtNode = nodes.find((n) => n.name === tgt);
-                if (!tgtNode) continue;
-                edgeList.push({
-                  x1: srcNode.position.x_m,
-                  y1: srcNode.position.y_m,
-                  x2: tgtNode.position.x_m,
-                  y2: tgtNode.position.y_m,
-                });
-              }
-            }
-
-            for (const edge of edgeList) {
-              const dx = edge.x2 - edge.x1;
-              const dy = edge.y2 - edge.y1;
-              const lenSq = dx * dx + dy * dy;
-              if (lenSq === 0) continue;
-              let t =
-                ((finalX - edge.x1) * dx + (finalY - edge.y1) * dy) / lenSq;
-              t = Math.max(0, Math.min(1, t));
-              const projX = edge.x1 + t * dx;
-              const projY = edge.y1 + t * dy;
-              const dist = this._distance(finalX, finalY, projX, projY);
-              if (dist < bestDist && dist < this.MAP_MATCH_THRESHOLD) {
-                bestDist = dist;
-                bestPoint = { x: projX, y: projY };
-              }
-            }
-            if (bestDist < this.MAP_MATCH_THRESHOLD) {
-              finalX = bestPoint.x;
-              finalY = bestPoint.y;
-            }
-          }
-        }
+        // 🚫 MAP MATCHING REMOVED — no more snap-to-wayfinding-edge
 
         // ---- Velocity limiting ----
         const now = Date.now();
@@ -962,16 +899,13 @@ class AssetTracker extends EventEmitter {
         const ppm = MAP_CONFIGS[state.map_id]?.ppm ?? 50.0739;
         let newPos = { x_m: finalX, y_m: finalY, ppm };
 
-        // ---- Best position (peak RSSI snapshot) ----
+        // ---- Best position ----
         if (primaryDet) {
           const rssi = primaryDet.rssi;
           if (rssi > state.bestRSSI) {
             state.bestPosition = { ...newPos };
             state.bestRSSI = rssi;
             state.positionStable = true;
-            console.log(
-              `📍 ${mac}: Best position updated (RSSI ${rssi} dBm)`
-            );
           }
         }
 
@@ -979,10 +913,7 @@ class AssetTracker extends EventEmitter {
         if (state.currentPosition) {
           const prevPos = state.currentPosition;
           const dist = this._distance(
-            prevPos.x_m,
-            prevPos.y_m,
-            newPos.x_m,
-            newPos.y_m
+            prevPos.x_m, prevPos.y_m, newPos.x_m, newPos.y_m
           );
           if (dist > this.STABILITY_THRESHOLD) {
             if (state.bestPosition) {
@@ -1001,13 +932,10 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ---- Stationary Drift Guard (final filter) ----
+        // ---- Stationary Drift Guard ----
         if (this.USE_STATIONARY_GUARD) {
           const guarded = StationaryDriftGuard.applyStationaryLock(
-            state,
-            newPos.x_m,
-            newPos.y_m,
-            this.STATIONARY_CFG
+            state, newPos.x_m, newPos.y_m, this.STATIONARY_CFG
           );
           newPos.x_m = guarded.x;
           newPos.y_m = guarded.y;
@@ -1022,21 +950,27 @@ class AssetTracker extends EventEmitter {
         state.lastUpdateTime = now;
         state.stabilityScore = this._calculateStability(state, apRssiMap);
 
+        // ---- Append to dynamic trail ----
+        this._appendToTrail(state, newPos.x_m, newPos.y_m, now);
+
         // ---- Dead-zone emit ----
         const lastEmit = state.lastEmittedPos;
         if (
           !lastEmit ||
           this._distance(
-            lastEmit.x_m,
-            lastEmit.y_m,
-            newPos.x_m,
-            newPos.y_m
+            lastEmit.x_m, lastEmit.y_m, newPos.x_m, newPos.y_m
           ) >= this.MIN_MOVE_METERS
         ) {
+          const trail = state.positionTrail || [];
+          const trailTail = trail.slice(-this.TRAIL_EMIT_POINTS);
+          const trailTailPx = this._trailToPixels(trailTail, state.map_id);
+
           this.emit("assetUpdate", {
             mac,
             device_name: state.device_name,
             position: state.currentPosition,
+            trail: trailTail,
+            trail_px: trailTailPx,
             raw: primaryDet,
             stability: state.stabilityScore,
             is_most_accurate: state.positionStable,
@@ -1055,6 +989,8 @@ class AssetTracker extends EventEmitter {
           mac,
           device_name: state.device_name,
           position: state.currentPosition,
+          trail: [...(state.positionTrail || [])],
+          trail_px: this._trailToPixels(state.positionTrail, state.map_id),
           ap_mac: primaryAP.apMac,
           rssi: primaryAP.smoothedRssi,
           beam: primaryDet?.beam || null,
@@ -1142,51 +1078,41 @@ class AssetTracker extends EventEmitter {
 // Export singleton
 // ============================================================
 const options = {
-  // RSSI / centroid smoothing
   emaAlpha: 0.15,
   positionAlpha: 0.25,
-
-  // Primary-AP hysteresis
   hysteresisDb: 12,
   hysteresisCount: 4,
   topAps: 3,
-
-  // Position guards
   stabilityThreshold: 3.0,
   outlierThreshold: 5.0,
   minMoveMeters: 0.5,
   maxSpeedMs: 2.0,
   minRssi: -75,
-
-  // Heatmap
   heatmapWindow: 30,
   heatmapRadius: 2.0,
-
-  // Particle filter
   particleCount: 100,
   particleNoise: 0.5,
   measurementNoise: 1.0,
   useParticleFilter: true,
-
-  // Map matching
   useHeatmap: true,
-  useMapMatching: true,
-  mapMatchThreshold: 3.0,
-
-  // AP correction / static-anchor pin
   strongRssiPinDb: -62,
   pinDistanceThresholdM: 5.0,
-
-  // Stationary Drift Guard
   useStationaryGuard: true,
   stationaryThresholdM: 0.80,
   stationaryFastThresholdM: 1.5,
   stationaryAlpha: 0.02,
   movingAlpha: 0.45,
+
+  // ---- Dynamic trail ----
+  useTrail: true,
+  trailMaxPoints: 300,          // ~30 s at 10 Hz
+  trailMinMoveM: 0.25,          // ignore points for sub-25cm jitter
+  trailMaxAgeMs: 5 * 60 * 1000, // forget points older than 5 min
+  trailEmitPoints: 100,         // cap how many points go out per emit
 };
 
 const assetTracker = new AssetTracker(options);
 console.log(
-  "✅ mistAssetTracker loaded: AP corrections + static-anchor pin + stationary drift guard"
+  "✅ mistAssetTracker loaded: dynamic trail mode (wayfinding snapping removed)"
 );
 module.exports = assetTracker;
