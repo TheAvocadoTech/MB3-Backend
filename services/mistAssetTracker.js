@@ -1078,37 +1078,43 @@ class AssetTracker extends EventEmitter {
 // Export singleton
 // ============================================================
 const options = {
-  emaAlpha: 0.15,
-  positionAlpha: 0.25,
-  hysteresisDb: 12,
-  hysteresisCount: 4,
+  // 1. Make Signal Response Faster
+  emaAlpha: 0.45,             // (Was 0.15) Increases responsiveness to RSSI changes
+  positionAlpha: 0.50,        // (Was 0.25) Moves position quickly towards new coordinates
+  
+  // 2. Faster AP Switching
+  hysteresisDb: 6,            // (Was 12) Lower threshold to switch primary AP
+  hysteresisCount: 2,         // (Was 4) Takes only 2 polls (~2.4s) to switch primary AP
+  
   topAps: 3,
-  stabilityThreshold: 3.0,
-  outlierThreshold: 5.0,
-  minMoveMeters: 0.5,
-  maxSpeedMs: 2.0,
-  minRssi: -75,
-  heatmapWindow: 30,
-  heatmapRadius: 2.0,
-  particleCount: 100,
-  particleNoise: 0.5,
-  measurementNoise: 1.0,
-  useParticleFilter: true,
-  useHeatmap: true,
+  stabilityThreshold: 4.0,    // Allow larger quick movements
+  outlierThreshold: 6.0,
+  
+  // 3. Lower Emission Dead-Zone
+  minMoveMeters: 0.15,        // (Was 0.5) Emits updates for small moves (>15cm)
+  maxSpeedMs: 3.5,            // (Was 2.0) Allows faster walking speeds (~12 km/h)
+  minRssi: -80,
+
+  // 4. Disable Heavy Overhead Filters
+  useParticleFilter: false,   // (Was true) Switch to fast EMA for immediate response
+  useHeatmap: false,          // (Was true) Heatmap window delays position output by 5-10s
+  
   strongRssiPinDb: -62,
   pinDistanceThresholdM: 5.0,
+  
+  // 5. Make Stationary Guard Fast
   useStationaryGuard: true,
-  stationaryThresholdM: 0.80,
-  stationaryFastThresholdM: 1.5,
-  stationaryAlpha: 0.02,
-  movingAlpha: 0.45,
+  stationaryThresholdM: 0.40,  // (Was 0.80) Lock kicks in only when almost completely still
+  stationaryFastThresholdM: 1.0, 
+  stationaryAlpha: 0.20,      // (Was 0.02) Fast ramp-up when starting to move
+  movingAlpha: 0.70,          // (Was 0.45) 70% weight to new position when active
 
-  // ---- Dynamic trail ----
+  // Dynamic trail
   useTrail: true,
-  trailMaxPoints: 300,          // ~30 s at 10 Hz
-  trailMinMoveM: 0.25,          // ignore points for sub-25cm jitter
-  trailMaxAgeMs: 5 * 60 * 1000, // forget points older than 5 min
-  trailEmitPoints: 100,         // cap how many points go out per emit
+  trailMaxPoints: 300,
+  trailMinMoveM: 0.15,        // Lower trail threshold
+  trailMaxAgeMs: 5 * 60 * 1000,
+  trailEmitPoints: 100,
 };
 
 const assetTracker = new AssetTracker(options);
