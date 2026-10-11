@@ -4,10 +4,10 @@
 //   - Mist API polling (with 429 backoff) + caching
 //   - Local AP list from ap_list.json + AP_CORRECTIONS
 //   - Per-AP RSSI offset + AoA vector rotation + static-anchor pinning
-//   - AoA / beam triangulation (NEW)  ← uses Mist's "beam" field
+//   - AoA / beam triangulation  ← uses Mist's "beam" field
 //   - RSSI-weighted AP centroid (fallback / blend)
 //   - Particle filter (or EMA fallback)
-//   - Median outlier rejection
+//   - Median outlier rejection  + outlier-streak recovery
 //   - Heatmap density smoothing
 //   - Velocity limiting + jump guard
 //   - Stationary Drift Guard (dead-zone lock + adaptive alpha)
@@ -74,11 +74,14 @@ const MAP_CONFIGS = {
 // AP CORRECTIONS
 // ============================================================
 // rotationOffsetDeg  → rotates AoA / beam angle AND the detection vector
+//                      ⚠️ Only set this after empirically verifying beam
+//                      direction with a test tag. Wrong value = beam points
+//                      in the opposite direction and tag drifts away.
 // rssiOffsetDb       → added to raw RSSI before weighting
 // isStaticZoneAnchor → pin to AP coords when RSSI is very strong
 const AP_CORRECTIONS = {
   c878678aa2ab: {
-    rotationOffsetDeg: 180,
+    rotationOffsetDeg: 0,      // ← FIXED: was 180 (beam was flipped backwards)
     rssiOffsetDb: +4,
     isStaticZoneAnchor: true,
     zoneBounds: { minX: 100, maxX: 115, minY: 25, maxY: 35 },
@@ -218,6 +221,7 @@ class AssetTracker extends EventEmitter {
     this.TOP_APS = options.topAps ?? 3;
     this.STABILITY_THRESHOLD = options.stabilityThreshold ?? 3.0;
     this.OUTLIER_THRESHOLD = options.outlierThreshold ?? 5.0;
+    this.OUTLIER_RECOVERY_STREAK = options.outlierRecoveryStreak ?? 5; // NEW
     this.MIN_MOVE_METERS = options.minMoveMeters ?? 0.5;
     this.MAX_SPEED_MS = options.maxSpeedMs ?? 2.0;
     this.MIN_RSSI = options.minRssi ?? -75;
@@ -254,11 +258,11 @@ class AssetTracker extends EventEmitter {
 
     // --- AoA / beam triangulation ---
     this.USE_BEAM_TRIANGULATION = options.useBeamTriangulation ?? true;
-    this.BEAM_WIDTH_DEG = options.beamWidthDeg ?? 30;         // 12 beams × 30° = 360°
-    this.BEAM_ZERO_OFFSET_DEG = options.beamZeroOffsetDeg ?? 0; // rotate whole beam frame
-    this.BEAM_WEIGHT = options.beamWeight ?? 0.75;            // 0..1 blend vs RSSI centroid
-    this.BEAM_MAX_RAY_M = options.beamMaxRayM ?? 40;          // reject absurd intersections
-    this.BEAM_MIN_ANGLE_DEG = options.beamMinAngleDeg ?? 25;  // reject near-parallel pairs
+    this.BEAM_WIDTH_DEG = options.beamWidthDeg ?? 30;
+    this.BEAM_ZERO_OFFSET_DEG = options.beamZeroOffsetDeg ?? 0;
+    this.BEAM_WEIGHT = options.beamWeight ?? 0.75;
+    this.BEAM_MAX_RAY_M = options.beamMaxRayM ?? 40;
+    this.BEAM_MIN_ANGLE_DEG = options.beamMinAngleDeg ?? 25;
 
     // --- Backoff / cache ---
     this.backoffUntil = 0;
@@ -354,8 +358,8 @@ class AssetTracker extends EventEmitter {
         rssi: state.currentAP?.rssi || state.bestRSSI || null,
         raw_rssi: state.lastRawRssi || null,
         apHistory: state.apHistory?.slice(-5) || [],
-        // NEW: expose last triangulation result for debugging / UI
         triangulation: state.lastTriangulation || null,
+        outlierStreak: state.outlierStreak || 0,     // NEW
       };
     }
     return states;
@@ -402,7 +406,6 @@ class AssetTracker extends EventEmitter {
     try {
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
 
-      // Successful call → reset backoff
       this.backoffMultiplier = 1;
       this.backoffUntil = 0;
 
@@ -422,7 +425,6 @@ class AssetTracker extends EventEmitter {
       return this.cachedProcessedAssets;
 
     } catch (err) {
-      // ---- 429 handling: cap every retry at 1 second ----
       if (err.response && err.response.status === 429) {
         const waitMs = 1000;
         this.backoffUntil = Date.now() + waitMs;
@@ -434,7 +436,6 @@ class AssetTracker extends EventEmitter {
           : [];
       }
 
-      // ---- Any other error ----
       console.error("Mist API Error:", err.message);
       if (err.response) {
         console.error("Status:", err.response.status);
@@ -487,9 +488,6 @@ class AssetTracker extends EventEmitter {
   // ============================================================
   // ✨ AoA / beam triangulation
   // ============================================================
-  // Convert a Mist "beam" index into an absolute angle in radians.
-  //   absolute_angle = beam * beamWidth + AP_orientation + beamZeroOffset
-  // 0 rad = +X axis (map East), CCW positive.
   _beamToAbsoluteAngleRad(beamIdx, apOrientationDeg) {
     const deg =
       beamIdx * this.BEAM_WIDTH_DEG +
@@ -498,9 +496,6 @@ class AssetTracker extends EventEmitter {
     return (deg * Math.PI) / 180;
   }
 
-  // Ray-ray intersection helper.
-  //   Ray A: p = A + t*Da,  Ray B: p = B + s*Db
-  // Returns { x, y } or null if parallel / divergent / out of bounds.
   _rayIntersection(A, Da, B, Db) {
     const denom = Da.x * Db.y - Da.y * Db.x;
     if (Math.abs(denom) < 1e-6) return null;
@@ -511,19 +506,15 @@ class AssetTracker extends EventEmitter {
     const t = (ex * Db.y - ey * Db.x) / denom;
     const s = (ex * Da.y - ey * Da.x) / denom;
 
-    // Both rays must be forward (t>0, s>0) AND within max ray length
     if (t <= 0 || s <= 0) return null;
     if (t > this.BEAM_MAX_RAY_M || s > this.BEAM_MAX_RAY_M) return null;
 
     return { x: A.x + t * Da.x, y: A.y + t * Da.y, tDist: t, sDist: s };
   }
 
-  // Main triangulation: takes raw Mist detections for one asset,
-  // returns { x_m, y_m, confidence, pairs } or null.
   _triangulateWithBeams(detections) {
     if (!this.USE_BEAM_TRIANGULATION) return null;
 
-    // Collect usable beam observations (must have beam + known AP position)
     const beamObs = [];
     for (const det of detections) {
       if (det.beam == null) continue;
@@ -531,7 +522,6 @@ class AssetTracker extends EventEmitter {
       const ap = this.apMap.get(det.ap_mac);
       if (!ap) continue;
 
-      // Beam index must be a finite number in a sane range
       const beamIdx = Number(det.beam);
       if (!Number.isFinite(beamIdx)) continue;
       if (beamIdx < 0 || beamIdx > 23) continue;
@@ -545,10 +535,8 @@ class AssetTracker extends EventEmitter {
       });
     }
 
-    // Need at least 2 APs with beam data for a true triangulation
     if (beamObs.length < 2) return null;
 
-    // Build candidate intersections from every AP pair
     const pairs = [];
     for (let i = 0; i < beamObs.length; i++) {
       for (let j = i + 1; j < beamObs.length; j++) {
@@ -559,7 +547,6 @@ class AssetTracker extends EventEmitter {
         const angA = this._beamToAbsoluteAngleRad(a.beamIdx, a.ap.orientation);
         const angB = this._beamToAbsoluteAngleRad(b.beamIdx, b.ap.orientation);
 
-        // Reject near-parallel beams — intersection is unstable
         let dAng = Math.abs(angA - angB) * 180 / Math.PI;
         dAng = Math.min(dAng, 360 - dAng);
         if (dAng < this.BEAM_MIN_ANGLE_DEG) continue;
@@ -572,7 +559,6 @@ class AssetTracker extends EventEmitter {
         const hit = this._rayIntersection(A, Da, B, Db);
         if (!hit) continue;
 
-        // Weight each intersection by combined signal strength
         const pairWeight = Math.pow(10, (a.correctedRssi + b.correctedRssi) / 20);
         pairs.push({ x: hit.x, y: hit.y, weight: pairWeight, dAng });
       }
@@ -580,7 +566,6 @@ class AssetTracker extends EventEmitter {
 
     if (pairs.length === 0) return null;
 
-    // Weighted mean of all intersections
     let sumX = 0, sumY = 0, sumW = 0;
     for (const p of pairs) {
       sumX += p.x * p.weight;
@@ -591,7 +576,6 @@ class AssetTracker extends EventEmitter {
     const x_m = sumX / sumW;
     const y_m = sumY / sumW;
 
-    // Confidence: more pairs + tighter cluster = higher confidence
     let variance = 0;
     for (const p of pairs) {
       variance += this._distance(p.x, p.y, x_m, y_m) ** 2;
@@ -599,7 +583,6 @@ class AssetTracker extends EventEmitter {
     variance /= pairs.length;
     const stdDev = Math.sqrt(variance);
 
-    // stdDev <= 1m → 1.0 confidence; >= 8m → 0 confidence
     const spreadConf = Math.max(0, 1 - stdDev / 8);
     const countConf = Math.min(1, pairs.length / 4);
     const confidence = 0.6 * spreadConf + 0.4 * countConf;
@@ -689,7 +672,8 @@ class AssetTracker extends EventEmitter {
             particleFilter: null,
             isMoving: false,
             positionTrail: [],
-            lastTriangulation: null,   // NEW
+            lastTriangulation: null,
+            outlierStreak: 0,        // NEW
           };
           if (this.USE_PARTICLE_FILTER) {
             state.particleFilter = new ParticleFilter(
@@ -851,7 +835,6 @@ class AssetTracker extends EventEmitter {
             }
           }
 
-          // Fallback to top-N APs if no positions came through
           if (rssiCentroidX === null || rssiCentroidY === null) {
             const topAps = sortedAPs.slice(0, this.TOP_APS);
             let mX = 0, mY = 0, mW = 0;
@@ -883,7 +866,7 @@ class AssetTracker extends EventEmitter {
         }
 
         // =========================================================
-        // STEP 2 — ✨ AoA / beam triangulation
+        // STEP 2 — AoA / beam triangulation
         // =========================================================
         const beamResult = this._triangulateWithBeams(detections);
         state.lastTriangulation = beamResult
@@ -910,7 +893,6 @@ class AssetTracker extends EventEmitter {
           !beamResult && rssiCentroidX !== null && rssiCentroidY !== null;
 
         if (haveBeam) {
-          // Confidence-scaled blend: high confidence → trust beam more
           const w = this.BEAM_WEIGHT * (0.5 + 0.5 * beamResult.confidence);
           measurementX = w * beamResult.x_m + (1 - w) * rssiCentroidX;
           measurementY = w * beamResult.y_m + (1 - w) * rssiCentroidY;
@@ -927,7 +909,7 @@ class AssetTracker extends EventEmitter {
           measurementX = rssiCentroidX;
           measurementY = rssiCentroidY;
         } else {
-          continue; // no usable measurement
+          continue;
         }
 
         // ---- Static-anchor pin ----
@@ -991,7 +973,9 @@ class AssetTracker extends EventEmitter {
           filteredY = state.smoothedPos.y_m;
         }
 
-        // ---- Outlier rejection ----
+        // =========================================================
+        // ---- Outlier rejection (WITH STREAK RECOVERY) ----
+        // =========================================================
         if (!this.positionHistory.has(mac)) this.positionHistory.set(mac, []);
         const history = this.positionHistory.get(mac);
 
@@ -1001,15 +985,36 @@ class AssetTracker extends EventEmitter {
           const medX = this._median(xs);
           const medY = this._median(ys);
           const dist = this._distance(medX, medY, filteredX, filteredY);
+
           if (dist > this.OUTLIER_THRESHOLD) {
-            console.log(
-              `🛑 Outlier rejected for ${mac}: ${dist.toFixed(
-                2
-              )}m from median – keeping previous`
-            );
-            continue;
+            state.outlierStreak = (state.outlierStreak || 0) + 1;
+
+            // If we've been rejecting for N updates in a row, the "history"
+            // itself is the problem — reset it and accept the new measurement.
+            if (state.outlierStreak >= this.OUTLIER_RECOVERY_STREAK) {
+              console.warn(
+                `♻️ Outlier recovery for ${mac}: ${state.outlierStreak} rejects in a row → resetting history`
+              );
+              history.length = 0;
+              state.smoothedPos = null;
+              if (state.particleFilter) {
+                state.particleFilter.initialized = false;
+              }
+              state.outlierStreak = 0;
+              // Fall through — accept this measurement
+            } else {
+              console.log(
+                `🛑 Outlier rejected for ${mac}: ${dist.toFixed(
+                  2
+                )}m (streak ${state.outlierStreak}/${this.OUTLIER_RECOVERY_STREAK})`
+              );
+              continue;
+            }
+          } else {
+            state.outlierStreak = 0;
           }
         }
+
         history.push({ x_m: filteredX, y_m: filteredY, timestamp: Date.now() });
         if (history.length > this.MAX_HISTORY) history.shift();
 
@@ -1150,11 +1155,12 @@ class AssetTracker extends EventEmitter {
             is_moving: state.isMoving,
             best_rssi: state.bestRSSI,
             timestamp: now,
-            triangulation: state.lastTriangulation,   // NEW
+            triangulation: state.lastTriangulation,
+            outlierStreak: state.outlierStreak || 0,   // NEW
             topAps: Array.from(detectionsMap.values()).map((d) => ({
               ap: d.ap_mac,
               rssi: d.rssi,
-              beam: d.beam ?? null,                   // NEW
+              beam: d.beam ?? null,
             })),
           });
           state.lastEmittedPos = { x_m: newPos.x_m, y_m: newPos.y_m };
@@ -1175,7 +1181,8 @@ class AssetTracker extends EventEmitter {
           is_moving: state.isMoving,
           best_rssi: state.bestRSSI,
           ppm,
-          triangulation: state.lastTriangulation,     // NEW
+          triangulation: state.lastTriangulation,
+          outlierStreak: state.outlierStreak || 0,      // NEW
         });
 
         if (state.apHistory.length > 0) {
@@ -1261,6 +1268,7 @@ const options = {
   topAps: 3,
   stabilityThreshold: 3.0,
   outlierThreshold: 5.0,
+  outlierRecoveryStreak: 5,     // NEW — reset history after 5 consecutive rejects
   minMoveMeters: 0.5,
   maxSpeedMs: 2.0,
   minRssi: -75,
@@ -1288,15 +1296,15 @@ const options = {
 
   // ---- ✨ AoA / beam triangulation ----
   useBeamTriangulation: true,
-  beamWidthDeg: 30,             // 12 beams × 30° = 360° (typical Mist)
-  beamZeroOffsetDeg: 0,         // tune if beams point wrong way
-  beamWeight: 0.75,             // 0..1 — how much to trust beam vs RSSI
-  beamMaxRayM: 40,              // reject intersections farther than this
-  beamMinAngleDeg: 25,          // reject near-parallel AP pairs
+  beamWidthDeg: 30,
+  beamZeroOffsetDeg: 0,
+  beamWeight: 0.75,
+  beamMaxRayM: 40,
+  beamMinAngleDeg: 25,
 };
 
 const assetTracker = new AssetTracker(options);
 console.log(
-  "✅ mistAssetTracker loaded: AoA triangulation + dynamic trail mode"
+  "✅ mistAssetTracker loaded: AoA triangulation + outlier recovery + dynamic trail"
 );
 module.exports = assetTracker;
