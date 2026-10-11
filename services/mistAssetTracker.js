@@ -4,7 +4,8 @@
 //   - Mist API polling (with 429 backoff) + caching
 //   - Local AP list from ap_list.json + AP_CORRECTIONS
 //   - Per-AP RSSI offset + AoA vector rotation + static-anchor pinning
-//   - RSSI-weighted AP centroid
+//   - AoA / beam triangulation (NEW)  ← uses Mist's "beam" field
+//   - RSSI-weighted AP centroid (fallback / blend)
 //   - Particle filter (or EMA fallback)
 //   - Median outlier rejection
 //   - Heatmap density smoothing
@@ -72,6 +73,9 @@ const MAP_CONFIGS = {
 // ============================================================
 // AP CORRECTIONS
 // ============================================================
+// rotationOffsetDeg  → rotates AoA / beam angle AND the detection vector
+// rssiOffsetDb       → added to raw RSSI before weighting
+// isStaticZoneAnchor → pin to AP coords when RSSI is very strong
 const AP_CORRECTIONS = {
   c878678aa2ab: {
     rotationOffsetDeg: 180,
@@ -243,10 +247,18 @@ class AssetTracker extends EventEmitter {
 
     // --- Dynamic path (breadcrumb trail) ---
     this.USE_TRAIL = options.useTrail ?? true;
-    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;   // ~30s @ 10Hz
-    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;    // ignore jitter
-    this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000; // 5 min
-    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;  // cap emit size
+    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;
+    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;
+    this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
+    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
+
+    // --- AoA / beam triangulation ---
+    this.USE_BEAM_TRIANGULATION = options.useBeamTriangulation ?? true;
+    this.BEAM_WIDTH_DEG = options.beamWidthDeg ?? 30;         // 12 beams × 30° = 360°
+    this.BEAM_ZERO_OFFSET_DEG = options.beamZeroOffsetDeg ?? 0; // rotate whole beam frame
+    this.BEAM_WEIGHT = options.beamWeight ?? 0.75;            // 0..1 blend vs RSSI centroid
+    this.BEAM_MAX_RAY_M = options.beamMaxRayM ?? 40;          // reject absurd intersections
+    this.BEAM_MIN_ANGLE_DEG = options.beamMinAngleDeg ?? 25;  // reject near-parallel pairs
 
     // --- Backoff / cache ---
     this.backoffUntil = 0;
@@ -342,6 +354,8 @@ class AssetTracker extends EventEmitter {
         rssi: state.currentAP?.rssi || state.bestRSSI || null,
         raw_rssi: state.lastRawRssi || null,
         apHistory: state.apHistory?.slice(-5) || [],
+        // NEW: expose last triangulation result for debugging / UI
+        triangulation: state.lastTriangulation || null,
       };
     }
     return states;
@@ -365,7 +379,6 @@ class AssetTracker extends EventEmitter {
     this.positionHistory.delete(mac);
   }
 
-  // Kept for backwards compat — no longer used internally
   setWayfindingData() {
     console.warn(
       "⚠️ setWayfindingData() is deprecated — the tracker now builds the path dynamically from the tag's own trail."
@@ -411,9 +424,9 @@ class AssetTracker extends EventEmitter {
     } catch (err) {
       // ---- 429 handling: cap every retry at 1 second ----
       if (err.response && err.response.status === 429) {
-        const waitMs = 1000;               // hard cap: 1 second
+        const waitMs = 1000;
         this.backoffUntil = Date.now() + waitMs;
-        this.backoffMultiplier = 1;        // no escalation
+        this.backoffMultiplier = 1;
         console.error("🚫 429 – retry after 1s");
         this.emit("rateLimited", { retryAfter: 1 });
         return this.cachedProcessedAssets.length > 0
@@ -436,7 +449,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Preprocess a single AP detection (AoA correction only)
+  // Preprocess a single AP detection (AoA vector rotation only)
   // ============================================================
   _preprocessDetection(apMac, rawX, rawY, rawRssi) {
     const ap = this.apMap.get(apMac);
@@ -472,6 +485,129 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
+  // ✨ AoA / beam triangulation
+  // ============================================================
+  // Convert a Mist "beam" index into an absolute angle in radians.
+  //   absolute_angle = beam * beamWidth + AP_orientation + beamZeroOffset
+  // 0 rad = +X axis (map East), CCW positive.
+  _beamToAbsoluteAngleRad(beamIdx, apOrientationDeg) {
+    const deg =
+      beamIdx * this.BEAM_WIDTH_DEG +
+      (apOrientationDeg || 0) +
+      this.BEAM_ZERO_OFFSET_DEG;
+    return (deg * Math.PI) / 180;
+  }
+
+  // Ray-ray intersection helper.
+  //   Ray A: p = A + t*Da,  Ray B: p = B + s*Db
+  // Returns { x, y } or null if parallel / divergent / out of bounds.
+  _rayIntersection(A, Da, B, Db) {
+    const denom = Da.x * Db.y - Da.y * Db.x;
+    if (Math.abs(denom) < 1e-6) return null;
+
+    const ex = B.x - A.x;
+    const ey = B.y - A.y;
+
+    const t = (ex * Db.y - ey * Db.x) / denom;
+    const s = (ex * Da.y - ey * Da.x) / denom;
+
+    // Both rays must be forward (t>0, s>0) AND within max ray length
+    if (t <= 0 || s <= 0) return null;
+    if (t > this.BEAM_MAX_RAY_M || s > this.BEAM_MAX_RAY_M) return null;
+
+    return { x: A.x + t * Da.x, y: A.y + t * Da.y, tDist: t, sDist: s };
+  }
+
+  // Main triangulation: takes raw Mist detections for one asset,
+  // returns { x_m, y_m, confidence, pairs } or null.
+  _triangulateWithBeams(detections) {
+    if (!this.USE_BEAM_TRIANGULATION) return null;
+
+    // Collect usable beam observations (must have beam + known AP position)
+    const beamObs = [];
+    for (const det of detections) {
+      if (det.beam == null) continue;
+      if (!det.ap_mac) continue;
+      const ap = this.apMap.get(det.ap_mac);
+      if (!ap) continue;
+
+      // Beam index must be a finite number in a sane range
+      const beamIdx = Number(det.beam);
+      if (!Number.isFinite(beamIdx)) continue;
+      if (beamIdx < 0 || beamIdx > 23) continue;
+
+      const correctedRssi = det.rssi + (ap.rssiOffset || 0);
+      beamObs.push({
+        apMac: det.ap_mac,
+        ap,
+        beamIdx,
+        correctedRssi,
+      });
+    }
+
+    // Need at least 2 APs with beam data for a true triangulation
+    if (beamObs.length < 2) return null;
+
+    // Build candidate intersections from every AP pair
+    const pairs = [];
+    for (let i = 0; i < beamObs.length; i++) {
+      for (let j = i + 1; j < beamObs.length; j++) {
+        const a = beamObs[i];
+        const b = beamObs[j];
+        if (a.apMac === b.apMac) continue;
+
+        const angA = this._beamToAbsoluteAngleRad(a.beamIdx, a.ap.orientation);
+        const angB = this._beamToAbsoluteAngleRad(b.beamIdx, b.ap.orientation);
+
+        // Reject near-parallel beams — intersection is unstable
+        let dAng = Math.abs(angA - angB) * 180 / Math.PI;
+        dAng = Math.min(dAng, 360 - dAng);
+        if (dAng < this.BEAM_MIN_ANGLE_DEG) continue;
+
+        const A = { x: a.ap.x_m, y: a.ap.y_m };
+        const B = { x: b.ap.x_m, y: b.ap.y_m };
+        const Da = { x: Math.cos(angA), y: Math.sin(angA) };
+        const Db = { x: Math.cos(angB), y: Math.sin(angB) };
+
+        const hit = this._rayIntersection(A, Da, B, Db);
+        if (!hit) continue;
+
+        // Weight each intersection by combined signal strength
+        const pairWeight = Math.pow(10, (a.correctedRssi + b.correctedRssi) / 20);
+        pairs.push({ x: hit.x, y: hit.y, weight: pairWeight, dAng });
+      }
+    }
+
+    if (pairs.length === 0) return null;
+
+    // Weighted mean of all intersections
+    let sumX = 0, sumY = 0, sumW = 0;
+    for (const p of pairs) {
+      sumX += p.x * p.weight;
+      sumY += p.y * p.weight;
+      sumW += p.weight;
+    }
+    if (sumW === 0) return null;
+    const x_m = sumX / sumW;
+    const y_m = sumY / sumW;
+
+    // Confidence: more pairs + tighter cluster = higher confidence
+    let variance = 0;
+    for (const p of pairs) {
+      variance += this._distance(p.x, p.y, x_m, y_m) ** 2;
+    }
+    variance /= pairs.length;
+    const stdDev = Math.sqrt(variance);
+
+    // stdDev <= 1m → 1.0 confidence; >= 8m → 0 confidence
+    const spreadConf = Math.max(0, 1 - stdDev / 8);
+    const countConf = Math.min(1, pairs.length / 4);
+    const confidence = 0.6 * spreadConf + 0.4 * countConf;
+
+    return { x_m, y_m, confidence, pairs: pairs.length, stdDev };
+  }
+
+  // ============================================================
   // Trail helpers
   // ============================================================
   _appendToTrail(state, x_m, y_m, now) {
@@ -481,20 +617,17 @@ class AssetTracker extends EventEmitter {
     const trail = state.positionTrail;
     const last = trail[trail.length - 1];
 
-    // Only add a point if the tag actually moved enough
     if (
       last &&
       this._distance(last.x_m, last.y_m, x_m, y_m) < this.TRAIL_MIN_MOVE_M
     ) {
-      // Still update age-based cleanup below
+      // skip — too small a move
     } else {
       trail.push({ x_m, y_m, t: now });
     }
 
-    // Cap by count
     while (trail.length > this.TRAIL_MAX_POINTS) trail.shift();
 
-    // Cap by age
     const cutoff = now - this.TRAIL_MAX_AGE_MS;
     while (trail.length > 0 && trail[0].t < cutoff) trail.shift();
   }
@@ -555,7 +688,8 @@ class AssetTracker extends EventEmitter {
             heatmapPositions: [],
             particleFilter: null,
             isMoving: false,
-            positionTrail: [],   // <-- NEW
+            positionTrail: [],
+            lastTriangulation: null,   // NEW
           };
           if (this.USE_PARTICLE_FILTER) {
             state.particleFilter = new ParticleFilter(
@@ -672,78 +806,128 @@ class AssetTracker extends EventEmitter {
           continue;
         }
 
-        // ---- AP centroid ----
+        // =========================================================
+        // STEP 1 — RSSI-weighted AP centroid (fallback / blend source)
+        // =========================================================
+        let rssiCentroidX = null;
+        let rssiCentroidY = null;
+        {
+          const apPositions = [];
+          for (const det of detections) {
+            const apMac = det.ap_mac;
+            const apInfo = this.apMap.get(apMac);
+
+            if (!apInfo) {
+              const coords = this._convertCoordinates(det.x, det.y, det.map_id);
+              if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
+                const pre = this._preprocessDetection(
+                  apMac, coords.x_m, coords.y_m, det.rssi
+                );
+                apPositions.push({
+                  x_m: pre.x_m, y_m: pre.y_m,
+                  weight: Math.pow(10, pre.correctedRssi / 10),
+                });
+              }
+              continue;
+            }
+
+            const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
+            apPositions.push({
+              x_m: apInfo.x_m, y_m: apInfo.y_m,
+              weight: Math.pow(10, correctedRssi / 10),
+            });
+          }
+
+          if (apPositions.length > 0) {
+            let sumX = 0, sumY = 0, sumW = 0;
+            for (const p of apPositions) {
+              sumX += p.x_m * p.weight;
+              sumY += p.y_m * p.weight;
+              sumW += p.weight;
+            }
+            if (sumW > 0) {
+              rssiCentroidX = sumX / sumW;
+              rssiCentroidY = sumY / sumW;
+            }
+          }
+
+          // Fallback to top-N APs if no positions came through
+          if (rssiCentroidX === null || rssiCentroidY === null) {
+            const topAps = sortedAPs.slice(0, this.TOP_APS);
+            let mX = 0, mY = 0, mW = 0;
+            for (const { apMac, smoothedRssi } of topAps) {
+              const det = detectionsMap.get(apMac);
+              if (!det) continue;
+              const coords = this._convertCoordinates(det.x, det.y, det.map_id);
+              if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
+                continue;
+              const pre = this._preprocessDetection(
+                apMac, coords.x_m, coords.y_m, smoothedRssi
+              );
+              const w = Math.pow(10, pre.correctedRssi / 10);
+              mX += pre.x_m * w;
+              mY += pre.y_m * w;
+              mW += w;
+            }
+            if (mW > 0) {
+              rssiCentroidX = mX / mW;
+              rssiCentroidY = mY / mW;
+            } else {
+              const primaryInfo = this.apMap.get(primaryAP.apMac);
+              if (primaryInfo) {
+                rssiCentroidX = primaryInfo.x_m;
+                rssiCentroidY = primaryInfo.y_m;
+              }
+            }
+          }
+        }
+
+        // =========================================================
+        // STEP 2 — ✨ AoA / beam triangulation
+        // =========================================================
+        const beamResult = this._triangulateWithBeams(detections);
+        state.lastTriangulation = beamResult
+          ? {
+              x_m: beamResult.x_m,
+              y_m: beamResult.y_m,
+              confidence: beamResult.confidence,
+              pairs: beamResult.pairs,
+              stdDev: beamResult.stdDev,
+            }
+          : null;
+
+        // =========================================================
+        // STEP 3 — Combine beam + RSSI centroid
+        // =========================================================
         let measurementX = null;
         let measurementY = null;
-        const apPositions = [];
 
-        for (const det of detections) {
-          const apMac = det.ap_mac;
-          const apInfo = this.apMap.get(apMac);
+        const haveBeam =
+          beamResult && rssiCentroidX !== null && rssiCentroidY !== null;
+        const haveOnlyBeam =
+          beamResult && (rssiCentroidX === null || rssiCentroidY === null);
+        const haveOnlyRssi =
+          !beamResult && rssiCentroidX !== null && rssiCentroidY !== null;
 
-          if (!apInfo) {
-            const coords = this._convertCoordinates(det.x, det.y, det.map_id);
-            if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
-              const pre = this._preprocessDetection(
-                apMac, coords.x_m, coords.y_m, det.rssi
-              );
-              apPositions.push({
-                x_m: pre.x_m, y_m: pre.y_m,
-                weight: Math.pow(10, pre.correctedRssi / 10),
-              });
-            }
-            continue;
-          }
+        if (haveBeam) {
+          // Confidence-scaled blend: high confidence → trust beam more
+          const w = this.BEAM_WEIGHT * (0.5 + 0.5 * beamResult.confidence);
+          measurementX = w * beamResult.x_m + (1 - w) * rssiCentroidX;
+          measurementY = w * beamResult.y_m + (1 - w) * rssiCentroidY;
 
-          const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
-          apPositions.push({
-            x_m: apInfo.x_m, y_m: apInfo.y_m,
-            weight: Math.pow(10, correctedRssi / 10),
-          });
-        }
-
-        if (apPositions.length > 0) {
-          let sumX = 0, sumY = 0, sumW = 0;
-          for (const p of apPositions) {
-            sumX += p.x_m * p.weight;
-            sumY += p.y_m * p.weight;
-            sumW += p.weight;
-          }
-          if (sumW > 0) {
-            measurementX = sumX / sumW;
-            measurementY = sumY / sumW;
-          }
-        }
-
-        if (measurementX === null || measurementY === null) {
-          const topAps = sortedAPs.slice(0, this.TOP_APS);
-          let mX = 0, mY = 0, mW = 0;
-          for (const { apMac, smoothedRssi } of topAps) {
-            const det = detectionsMap.get(apMac);
-            if (!det) continue;
-            const coords = this._convertCoordinates(det.x, det.y, det.map_id);
-            if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
-              continue;
-            const pre = this._preprocessDetection(
-              apMac, coords.x_m, coords.y_m, smoothedRssi
-            );
-            const w = Math.pow(10, pre.correctedRssi / 10);
-            mX += pre.x_m * w;
-            mY += pre.y_m * w;
-            mW += w;
-          }
-          if (mW > 0) {
-            measurementX = mX / mW;
-            measurementY = mY / mW;
-          } else {
-            const primaryInfo = this.apMap.get(primaryAP.apMac);
-            if (primaryInfo) {
-              measurementX = primaryInfo.x_m;
-              measurementY = primaryInfo.y_m;
-            } else {
-              continue;
-            }
-          }
+          console.log(
+            `📐 AoA triangulation for ${mac}: conf=${beamResult.confidence.toFixed(
+              2
+            )}, pairs=${beamResult.pairs}, stdDev=${beamResult.stdDev.toFixed(2)}m`
+          );
+        } else if (haveOnlyBeam) {
+          measurementX = beamResult.x_m;
+          measurementY = beamResult.y_m;
+        } else if (haveOnlyRssi) {
+          measurementX = rssiCentroidX;
+          measurementY = rssiCentroidY;
+        } else {
+          continue; // no usable measurement
         }
 
         // ---- Static-anchor pin ----
@@ -873,8 +1057,6 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // 🚫 MAP MATCHING REMOVED — no more snap-to-wayfinding-edge
-
         // ---- Velocity limiting ----
         const now = Date.now();
         const dt = (now - state.lastUpdateTime) / 1000;
@@ -886,11 +1068,6 @@ class AssetTracker extends EventEmitter {
             const ratio = maxDist / dist;
             finalX = prevPos.x_m + (finalX - prevPos.x_m) * ratio;
             finalY = prevPos.y_m + (finalY - prevPos.y_m) * ratio;
-            console.log(
-              `⏱️ Speed limited for ${mac}: ${dist.toFixed(
-                2
-              )}m → ${maxDist.toFixed(2)}m`
-            );
           }
         }
 
@@ -916,9 +1093,6 @@ class AssetTracker extends EventEmitter {
           );
           if (dist > this.STABILITY_THRESHOLD) {
             if (state.bestPosition) {
-              console.log(
-                `⚠️ Large jump (${dist.toFixed(2)}m) – using best position`
-              );
               newPos = { ...state.bestPosition };
             } else {
               const blend = this.STABILITY_THRESHOLD / dist;
@@ -976,9 +1150,11 @@ class AssetTracker extends EventEmitter {
             is_moving: state.isMoving,
             best_rssi: state.bestRSSI,
             timestamp: now,
+            triangulation: state.lastTriangulation,   // NEW
             topAps: Array.from(detectionsMap.values()).map((d) => ({
               ap: d.ap_mac,
               rssi: d.rssi,
+              beam: d.beam ?? null,                   // NEW
             })),
           });
           state.lastEmittedPos = { x_m: newPos.x_m, y_m: newPos.y_m };
@@ -999,6 +1175,7 @@ class AssetTracker extends EventEmitter {
           is_moving: state.isMoving,
           best_rssi: state.bestRSSI,
           ppm,
+          triangulation: state.lastTriangulation,     // NEW
         });
 
         if (state.apHistory.length > 0) {
@@ -1104,14 +1281,22 @@ const options = {
 
   // ---- Dynamic trail ----
   useTrail: true,
-  trailMaxPoints: 300,          // ~30 s at 10 Hz
-  trailMinMoveM: 0.25,          // ignore points for sub-25cm jitter
-  trailMaxAgeMs: 5 * 60 * 1000, // forget points older than 5 min
-  trailEmitPoints: 100,         // cap how many points go out per emit
+  trailMaxPoints: 300,
+  trailMinMoveM: 0.25,
+  trailMaxAgeMs: 5 * 60 * 1000,
+  trailEmitPoints: 100,
+
+  // ---- ✨ AoA / beam triangulation ----
+  useBeamTriangulation: true,
+  beamWidthDeg: 30,             // 12 beams × 30° = 360° (typical Mist)
+  beamZeroOffsetDeg: 0,         // tune if beams point wrong way
+  beamWeight: 0.75,             // 0..1 — how much to trust beam vs RSSI
+  beamMaxRayM: 40,              // reject intersections farther than this
+  beamMinAngleDeg: 25,          // reject near-parallel AP pairs
 };
 
 const assetTracker = new AssetTracker(options);
 console.log(
-  "✅ mistAssetTracker loaded: dynamic trail mode (wayfinding snapping removed)"
+  "✅ mistAssetTracker loaded: AoA triangulation + dynamic trail mode"
 );
 module.exports = assetTracker;
