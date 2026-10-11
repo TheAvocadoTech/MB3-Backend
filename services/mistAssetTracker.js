@@ -1,8 +1,7 @@
 // services/mistAssetTracker.js
 // Full Mist asset tracker with dynamic position trail (breadcrumb path).
 //
-//   - ON-DEMAND Redis middle-layer (no polling, no setInterval)
-//   - Mist API hit only on cache miss / stale (with 429 backoff)
+//   - Mist API polling (with 429 backoff) + caching
 //   - Local AP list from ap_list.json + AP_CORRECTIONS
 //   - Per-AP RSSI offset + AoA vector rotation + static-anchor pinning
 //   - RSSI-weighted AP centroid
@@ -11,19 +10,14 @@
 //   - Heatmap density smoothing
 //   - Velocity limiting + jump guard
 //   - Stationary Drift Guard (dead-zone lock + adaptive alpha)
-//   - Dynamic position trail (breadcrumb, replaces wayfinding-path snapping)
+//   - Dynamic position trail (replaces wayfinding-path snapping)
 //
 // Exports a singleton EventEmitter.
-//
-// Request flow:
-//   Client → getAssetsCached() → Redis fresh? → HIT return
-//                              → MISS/STALE → Mist → process → Redis save → return
 
 const axios = require("axios");
 const EventEmitter = require("events");
 const fs = require("fs");
 const path = require("path");
-const { createClient } = require("redis");
 
 // ============================================================
 // ENV
@@ -33,21 +27,6 @@ if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
 
 const API_TOKEN = process.env.MIST_API_TOKEN;
 if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
-
-const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
-const ASSET_TTL_SEC = parseInt(process.env.ASSET_TTL_SEC || "300", 10);
-
-// Freshness window — data younger than this is served from Redis as-is
-const FRESH_WINDOW_MS = parseInt(
-  process.env.ASSET_FRESH_WINDOW_MS || "1500",
-  10
-);
-
-// Single-flight lock TTL (concurrent requests share one Mist fetch)
-const FETCH_LOCK_TTL_MS = parseInt(
-  process.env.ASSET_FETCH_LOCK_MS || "10000",
-  10
-);
 
 const mist = axios.create({
   baseURL: "https://api.mist.com/api/v1",
@@ -206,8 +185,7 @@ class StationaryDriftGuard {
       return { x: cx, y: cy, isMoving: false };
     }
 
-    const alpha =
-      distFromCurrent > fastThreshold ? movingAlpha : stationaryAlpha;
+    const alpha = distFromCurrent > fastThreshold ? movingAlpha : stationaryAlpha;
     return {
       x: alpha * candidateX + (1 - alpha) * cx,
       y: alpha * candidateY + (1 - alpha) * cy,
@@ -215,21 +193,6 @@ class StationaryDriftGuard {
     };
   }
 }
-
-// ============================================================
-// REDIS CLIENT (middle-layer storage)
-// ============================================================
-const redis = createClient({ url: REDIS_URL });
-redis.on("error", (e) => console.error("❌ Redis error:", e.message));
-
-// Key schema
-const K = {
-  asset: (mac) => `mist:asset:${mac}`,          // HASH  — latest snapshot
-  trail: (mac) => `mist:asset:${mac}:trail`,    // LIST  — breadcrumb points
-  index: "mist:assets:index",                   // SET   — all known macs
-  meta: "mist:assets:meta",                     // HASH  — last_fetch_at, last_error
-  lock: "mist:assets:fetch_lock",               // STRING — single-flight lock
-};
 
 // ============================================================
 // AssetTracker
@@ -280,23 +243,20 @@ class AssetTracker extends EventEmitter {
 
     // --- Dynamic path (breadcrumb trail) ---
     this.USE_TRAIL = options.useTrail ?? true;
-    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;
-    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;
-    this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
-    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
+    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;   // ~30s @ 10Hz
+    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;    // ignore jitter
+    this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000; // 5 min
+    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;  // cap emit size
 
-    // --- Backoff ---
+    // --- Backoff / cache ---
     this.backoffUntil = 0;
     this.backoffMultiplier = 1;
+    this.cachedProcessedAssets = [];
 
     // --- AP map ---
     this.apMap = new Map();
     this.apListFetched = false;
     this.unmappedLogged = new Set();
-
-    // --- Redis state ---
-    this._redisReady = false;
-    this._inflightFetch = null;
 
     this._loadStaticAPs();
   }
@@ -345,334 +305,10 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Redis lifecycle
-  // ============================================================
-  async initRedis() {
-    if (!redis.isOpen) await redis.connect();
-    this._redisReady = true;
-    console.log(`✅ Redis connected: ${REDIS_URL}`);
-    return this;
-  }
-  async closeRedis() {
-    if (redis.isOpen) await redis.quit();
-    this._redisReady = false;
-  }
-
-  // ============================================================
-  // PUBLIC API — callers use THESE (never call Mist directly)
-  // ============================================================
-
-  /**
-   * Get all assets (cache-aside).
-   * @param {Object} opts
-   * @param {boolean} opts.force       - skip Redis freshness, hit Mist
-   * @param {boolean} opts.allowStale  - serve stale Redis data if Mist fails
-   */
-  async getAssetsCached(opts = {}) {
-    const { force = false, allowStale = true } = opts;
-
-    if (!this._redisReady) {
-      return this._fetchAndStore();
-    }
-
-    if (!force) {
-      const meta = await redis.hGetAll(K.meta);
-      const lastFetch = parseInt(meta.last_fetch_at || "0", 10);
-      const age = Date.now() - lastFetch;
-
-      if (lastFetch > 0 && age <= FRESH_WINDOW_MS) {
-        const cached = await this._readAllFromRedis();
-        if (cached.length > 0) return cached;
-      }
-    }
-
-    try {
-      return await this._fetchAndStore();
-    } catch (err) {
-      if (allowStale) {
-        const stale = await this._readAllFromRedis();
-        if (stale.length > 0) {
-          console.log("↩️ Mist failed — serving stale Redis data");
-          return stale;
-        }
-      }
-      throw err;
-    }
-  }
-
-  async getAssetCached(mac, opts = {}) {
-    if (this._redisReady && !opts.force) {
-      const hit = await this._readOneFromRedis(mac);
-      if (hit && Date.now() - hit.updated_at <= FRESH_WINDOW_MS) {
-        return hit;
-      }
-    }
-    const all = await this.getAssetsCached({ force: true, allowStale: true });
-    return all.find((a) => a.mac === mac) || null;
-  }
-
-  async clearRedis() {
-    if (!this._redisReady) return;
-    const macs = await redis.sMembers(K.index);
-    const pipeline = redis.multi();
-    for (const mac of macs) {
-      pipeline.del(K.asset(mac));
-      pipeline.del(K.trail(mac));
-    }
-    pipeline.del(K.index);
-    pipeline.del(K.meta);
-    await pipeline.exec();
-  }
-
-  // ============================================================
-  // Internal — single-flight fetch + persist
-  // ============================================================
-  async _fetchAndStore() {
-    // In-process lock: same Node process me duplicate fetch rokta hai
-    if (this._inflightFetch) return this._inflightFetch;
-
-    // Cross-process lock: multi-instance deployments me dedupe
-    if (this._redisReady) {
-      const gotLock = await redis.set(K.lock, String(Date.now()), {
-        NX: true,
-        PX: FETCH_LOCK_TTL_MS,
-      });
-      if (!gotLock) {
-        // Koi aur fetch kar raha hai — wait karke Redis se padho
-        await new Promise((r) => setTimeout(r, 250));
-        const cached = await this._readAllFromRedis();
-        if (cached.length > 0) return cached;
-        // warna khud fetch karo (fallback)
-      }
-    }
-
-    this._inflightFetch = (async () => {
-      try {
-        // Backoff check
-        if (this.backoffUntil > Date.now()) {
-          const remaining = Math.ceil(
-            (this.backoffUntil - Date.now()) / 1000
-          );
-          console.log(
-            `⏳ Rate-limited – serving cache (${remaining}s remaining)`
-          );
-          return await this._readAllFromRedis();
-        }
-
-        const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
-        this.backoffMultiplier = 1;
-        this.backoffUntil = 0;
-
-        if (
-          response.data &&
-          Array.isArray(response.data) &&
-          response.data.length > 0
-        ) {
-          const processed = this._processAssetData(response.data);
-          await this._writeBatchToRedis(processed);
-          if (this._redisReady) {
-            await redis.hSet(K.meta, {
-              last_fetch_at: String(Date.now()),
-              last_error: "",
-            });
-            await redis.expire(K.meta, ASSET_TTL_SEC);
-          }
-          return processed;
-        }
-
-        // Empty response — stale serve karo
-        return await this._readAllFromRedis();
-      } catch (err) {
-        const status = err.response?.status;
-
-        if (status === 429) {
-          const retryAfter =
-            parseInt(err.response.headers["retry-after"], 10) || 30;
-          const waitMs = retryAfter * 1000 * this.backoffMultiplier;
-          this.backoffUntil = Date.now() + waitMs;
-          this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, 8);
-          console.error(
-            `🚫 429 – retry after ${Math.ceil(
-              waitMs / 1000
-            )}s (multiplier ${this.backoffMultiplier})`
-          );
-          if (this._redisReady) {
-            await redis.hSet(K.meta, { last_error: `429:${retryAfter}` });
-          }
-          this.emit("rateLimited", { retryAfter: Math.ceil(waitMs / 1000) });
-          return await this._readAllFromRedis();
-        }
-
-        console.error("Mist API Error:", err.message);
-        if (err.response) {
-          console.error("Status:", err.response.status);
-        }
-        if (this._redisReady) {
-          await redis.hSet(K.meta, { last_error: err.message });
-        }
-        throw err;
-      } finally {
-        if (this._redisReady) await redis.del(K.lock);
-        this._inflightFetch = null;
-      }
-    })();
-
-    return this._inflightFetch;
-  }
-
-  // ============================================================
-  // Redis read helpers
-  // ============================================================
-  async _readAllFromRedis() {
-    if (!this._redisReady) return [];
-    const macs = await redis.sMembers(K.index);
-    if (!macs || macs.length === 0) return [];
-
-    const pipeline = redis.multi();
-    for (const mac of macs) {
-      pipeline.hGetAll(K.asset(mac));
-      pipeline.lRange(K.trail(mac), 0, -1);
-    }
-    const results = await pipeline.exec();
-
-    const assets = [];
-    for (let i = 0; i < macs.length; i++) {
-      const hash = results[i * 2];
-      const trailRaw = results[i * 2 + 1];
-      if (!hash || Object.keys(hash).length === 0) continue;
-
-      const trail = (trailRaw || [])
-        .map((s) => {
-          try { return JSON.parse(s); } catch { return null; }
-        })
-        .filter(Boolean);
-
-      assets.push(this._hashToAsset(hash, trail));
-    }
-    return assets;
-  }
-
-  async _readOneFromRedis(mac) {
-    if (!this._redisReady) return null;
-    const pipeline = redis.multi();
-    pipeline.hGetAll(K.asset(mac));
-    pipeline.lRange(K.trail(mac), 0, -1);
-    const [hash, trailRaw] = await pipeline.exec();
-    if (!hash || Object.keys(hash).length === 0) return null;
-
-    const trail = (trailRaw || [])
-      .map((s) => {
-        try { return JSON.parse(s); } catch { return null; }
-      })
-      .filter(Boolean);
-    return this._hashToAsset(hash, trail);
-  }
-
-  _hashToAsset(hash, trail) {
-    const mapId = hash.map_id;
-    const cfg = MAP_CONFIGS[mapId];
-    const x_m = parseFloat(hash.x_m);
-    const y_m = parseFloat(hash.y_m);
-    const hasPos = Number.isFinite(x_m) && Number.isFinite(y_m);
-
-    const trail_px = cfg
-      ? trail.map((p) => ({
-          x: p.x_m * cfg.ppm + cfg.origin_x,
-          y: cfg.origin_y - p.y_m * cfg.ppm,
-          t: p.t,
-        }))
-      : trail.map((p) => ({ x: p.x_m, y: p.y_m, t: p.t }));
-
-    return {
-      mac: hash.mac,
-      device_name: hash.device_name,
-      map_id: mapId || null,
-      position: hasPos
-        ? { x_m, y_m, ppm: parseFloat(hash.ppm) || (cfg?.ppm ?? 50) }
-        : null,
-      position_px:
-        cfg && hasPos
-          ? { x: x_m * cfg.ppm + cfg.origin_x, y: cfg.origin_y - y_m * cfg.ppm }
-          : null,
-      trail,
-      trail_px,
-      ap_mac: hash.ap_mac || null,
-      rssi: hash.rssi !== "" ? parseFloat(hash.rssi) : null,
-      best_rssi: hash.best_rssi !== "" ? parseFloat(hash.best_rssi) : null,
-      beam: hash.beam !== "" ? parseFloat(hash.beam) : null,
-      stability: hash.stability !== "" ? parseFloat(hash.stability) : null,
-      is_moving: hash.is_moving === "1",
-      is_most_accurate: hash.is_most_accurate === "1",
-      updated_at: parseInt(hash.updated_at, 10) || 0,
-    };
-  }
-
-  // ============================================================
-  // Redis write helper (called ONLY after a Mist fetch)
-  // ============================================================
-  async _writeBatchToRedis(assets) {
-    if (!this._redisReady || !assets || assets.length === 0) return;
-    const now = Date.now();
-    const pipeline = redis.multi();
-
-    for (const a of assets) {
-      const mac = a.mac;
-      const cfg = MAP_CONFIGS[a.map_id];
-      const posPx =
-        cfg && a.position
-          ? {
-              x: a.position.x_m * cfg.ppm + cfg.origin_x,
-              y: cfg.origin_y - a.position.y_m * cfg.ppm,
-            }
-          : null;
-
-      pipeline.hSet(K.asset(mac), {
-        mac,
-        device_name: a.device_name || "Unknown",
-        map_id: a.map_id || "",
-        x_m: String(a.position?.x_m ?? ""),
-        y_m: String(a.position?.y_m ?? ""),
-        ppm: String(a.ppm ?? ""),
-        px_x: String(posPx?.x ?? ""),
-        px_y: String(posPx?.y ?? ""),
-        ap_mac: a.ap_mac || "",
-        rssi: String(a.rssi ?? ""),
-        best_rssi: String(a.best_rssi ?? ""),
-        beam: a.beam != null ? String(a.beam) : "",
-        stability: String(a.stability ?? ""),
-        is_moving: a.is_moving ? "1" : "0",
-        is_most_accurate: a.is_most_accurate ? "1" : "0",
-        updated_at: String(now),
-      });
-      pipeline.expire(K.asset(mac), ASSET_TTL_SEC);
-      pipeline.sAdd(K.index, mac);
-
-      const trail = a.trail || [];
-      if (trail.length > 0) {
-        const last = trail[trail.length - 1];
-        pipeline.rPush(
-          K.trail(mac),
-          JSON.stringify({ x_m: last.x_m, y_m: last.y_m, t: last.t || now })
-        );
-        pipeline.lTrim(K.trail(mac), -this.TRAIL_MAX_POINTS, -1);
-        pipeline.expire(K.trail(mac), ASSET_TTL_SEC);
-      }
-    }
-
-    try {
-      await pipeline.exec();
-    } catch (e) {
-      console.error("❌ Redis write failed:", e.message);
-    }
-  }
-
-  // ============================================================
-  // Public getters (legacy — Redis-backed)
+  // Public getters
   // ============================================================
   getCachedAssets() {
-    // Backward-compat: sync accessor returns last processed in-memory list.
-    // Prefer getAssetsCached() for correctness.
-    return this.cachedProcessedAssets || [];
+    return this.cachedProcessedAssets;
   }
 
   getAssetStates() {
@@ -729,10 +365,81 @@ class AssetTracker extends EventEmitter {
     this.positionHistory.delete(mac);
   }
 
+  // Kept for backwards compat — no longer used internally
   setWayfindingData() {
     console.warn(
       "⚠️ setWayfindingData() is deprecated — the tracker now builds the path dynamically from the tag's own trail."
     );
+  }
+
+  // ============================================================
+  // Mist polling
+  // ============================================================
+  async getAssets() {
+    const now = Date.now();
+
+    if (this.backoffUntil > now) {
+      const remaining = Math.ceil((this.backoffUntil - now) / 1000);
+      console.log(
+        `⏳ Rate-limited – returning cached data (${remaining}s remaining)`
+      );
+      return this.cachedProcessedAssets;
+    }
+
+    try {
+      const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
+      this.backoffMultiplier = 1;
+      this.backoffUntil = 0;
+
+      if (
+        response.data &&
+        Array.isArray(response.data) &&
+        response.data.length > 0
+      ) {
+        const processed = this._processAssetData(response.data);
+        this.cachedProcessedAssets = processed;
+        return processed;
+      }
+
+      console.log(
+        "⚠️ Mist returned empty or invalid asset list – returning cached data"
+      );
+      return this.cachedProcessedAssets;
+    } } catch (err) {
+  if (err.response && err.response.status === 429) {
+    const waitMs = 1000;                    // hard cap: 1 second
+    this.backoffUntil = Date.now() + waitMs;
+    this.backoffMultiplier = 1;             // no escalation
+    console.error("🚫 429 – retry after 1s");
+    this.emit("rateLimited", { retryAfter: 1 });
+    return this.cachedProcessedAssets.length > 0
+      ? this.cachedProcessedAssets
+      : [];
+  }
+
+  console.error("Mist API Error:", err.message);
+  if (err.response) {
+    console.error("Status:", err.response.status);
+    console.error("Data:", err.response.data);
+  }
+  if (this.cachedProcessedAssets.length > 0) {
+    console.log("↩️ Returning cached data due to API error");
+    return this.cachedProcessedAssets;
+  }
+  throw err;
+}
+
+      console.error("Mist API Error:", err.message);
+      if (err.response) {
+        console.error("Status:", err.response.status);
+        console.error("Data:", err.response.data);
+      }
+      if (this.cachedProcessedAssets.length > 0) {
+        console.log("↩️ Returning cached data due to API error");
+        return this.cachedProcessedAssets;
+      }
+      throw err;
+    }
   }
 
   // ============================================================
@@ -781,17 +488,20 @@ class AssetTracker extends EventEmitter {
     const trail = state.positionTrail;
     const last = trail[trail.length - 1];
 
+    // Only add a point if the tag actually moved enough
     if (
       last &&
       this._distance(last.x_m, last.y_m, x_m, y_m) < this.TRAIL_MIN_MOVE_M
     ) {
-      // Skip — jitter
+      // Still update age-based cleanup below
     } else {
       trail.push({ x_m, y_m, t: now });
     }
 
+    // Cap by count
     while (trail.length > this.TRAIL_MAX_POINTS) trail.shift();
 
+    // Cap by age
     const cutoff = now - this.TRAIL_MAX_AGE_MS;
     while (trail.length > 0 && trail[0].t < cutoff) trail.shift();
   }
@@ -852,7 +562,7 @@ class AssetTracker extends EventEmitter {
             heatmapPositions: [],
             particleFilter: null,
             isMoving: false,
-            positionTrail: [],
+            positionTrail: [],   // <-- NEW
           };
           if (this.USE_PARTICLE_FILTER) {
             state.particleFilter = new ParticleFilter(
@@ -865,7 +575,7 @@ class AssetTracker extends EventEmitter {
         }
         state.lastRawRssi = firstDet.rssi;
 
-        // ---- Per-AP EMA of RSSI ----
+        // ---- Per-AP EMA of RSSI (with offset applied) ----
         const apRssiMap = this.apRssiFilters.get(mac) || new Map();
         for (const det of detections) {
           const apMac = det.ap_mac;
@@ -1170,6 +880,8 @@ class AssetTracker extends EventEmitter {
           }
         }
 
+        // 🚫 MAP MATCHING REMOVED — no more snap-to-wayfinding-edge
+
         // ---- Velocity limiting ----
         const now = Date.now();
         const dt = (now - state.lastUpdateTime) / 1000;
@@ -1181,6 +893,11 @@ class AssetTracker extends EventEmitter {
             const ratio = maxDist / dist;
             finalX = prevPos.x_m + (finalX - prevPos.x_m) * ratio;
             finalY = prevPos.y_m + (finalY - prevPos.y_m) * ratio;
+            console.log(
+              `⏱️ Speed limited for ${mac}: ${dist.toFixed(
+                2
+              )}m → ${maxDist.toFixed(2)}m`
+            );
           }
         }
 
@@ -1206,11 +923,16 @@ class AssetTracker extends EventEmitter {
           );
           if (dist > this.STABILITY_THRESHOLD) {
             if (state.bestPosition) {
+              console.log(
+                `⚠️ Large jump (${dist.toFixed(2)}m) – using best position`
+              );
               newPos = { ...state.bestPosition };
             } else {
               const blend = this.STABILITY_THRESHOLD / dist;
-              newPos.x_m = prevPos.x_m + (newPos.x_m - prevPos.x_m) * blend;
-              newPos.y_m = prevPos.y_m + (newPos.y_m - prevPos.y_m) * blend;
+              newPos.x_m =
+                prevPos.x_m + (newPos.x_m - prevPos.x_m) * blend;
+              newPos.y_m =
+                prevPos.y_m + (newPos.y_m - prevPos.y_m) * blend;
               newPos.ppm = prevPos.ppm || newPos.ppm;
             }
           }
@@ -1237,7 +959,7 @@ class AssetTracker extends EventEmitter {
         // ---- Append to dynamic trail ----
         this._appendToTrail(state, newPos.x_m, newPos.y_m, now);
 
-        // ---- Emit (dead-zone gated) ----
+        // ---- Dead-zone emit ----
         const lastEmit = state.lastEmittedPos;
         if (
           !lastEmit ||
@@ -1389,29 +1111,14 @@ const options = {
 
   // ---- Dynamic trail ----
   useTrail: true,
-  trailMaxPoints: 300,
-  trailMinMoveM: 0.25,
-  trailMaxAgeMs: 5 * 60 * 1000,
-  trailEmitPoints: 100,
+  trailMaxPoints: 300,          // ~30 s at 10 Hz
+  trailMinMoveM: 0.25,          // ignore points for sub-25cm jitter
+  trailMaxAgeMs: 5 * 60 * 1000, // forget points older than 5 min
+  trailEmitPoints: 100,         // cap how many points go out per emit
 };
 
 const assetTracker = new AssetTracker(options);
-
-// Boot — Redis connect only. NO poller. NO setInterval.
-(async () => {
-  try {
-    await assetTracker.initRedis();
-    console.log(
-      "✅ mistAssetTracker loaded: on-demand Redis cache (no polling) + dynamic trail mode"
-    );
-  } catch (e) {
-    console.error("❌ Redis init failed:", e.message);
-  }
-})();
-
-process.on("SIGINT", async () => {
-  await assetTracker.closeRedis();
-  process.exit(0);
-});
-
+console.log(
+  "✅ mistAssetTracker loaded: dynamic trail mode (wayfinding snapping removed)"
+);
 module.exports = assetTracker;
