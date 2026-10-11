@@ -388,6 +388,8 @@ class AssetTracker extends EventEmitter {
 
     try {
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
+
+      // Successful call → reset backoff
       this.backoffMultiplier = 1;
       this.backoffUntil = 0;
 
@@ -405,30 +407,21 @@ class AssetTracker extends EventEmitter {
         "⚠️ Mist returned empty or invalid asset list – returning cached data"
       );
       return this.cachedProcessedAssets;
-    } } catch (err) {
-  if (err.response && err.response.status === 429) {
-    const waitMs = 1000;                    // hard cap: 1 second
-    this.backoffUntil = Date.now() + waitMs;
-    this.backoffMultiplier = 1;             // no escalation
-    console.error("🚫 429 – retry after 1s");
-    this.emit("rateLimited", { retryAfter: 1 });
-    return this.cachedProcessedAssets.length > 0
-      ? this.cachedProcessedAssets
-      : [];
-  }
 
-  console.error("Mist API Error:", err.message);
-  if (err.response) {
-    console.error("Status:", err.response.status);
-    console.error("Data:", err.response.data);
-  }
-  if (this.cachedProcessedAssets.length > 0) {
-    console.log("↩️ Returning cached data due to API error");
-    return this.cachedProcessedAssets;
-  }
-  throw err;
-}
+    } catch (err) {
+      // ---- 429 handling: cap every retry at 1 second ----
+      if (err.response && err.response.status === 429) {
+        const waitMs = 1000;               // hard cap: 1 second
+        this.backoffUntil = Date.now() + waitMs;
+        this.backoffMultiplier = 1;        // no escalation
+        console.error("🚫 429 – retry after 1s");
+        this.emit("rateLimited", { retryAfter: 1 });
+        return this.cachedProcessedAssets.length > 0
+          ? this.cachedProcessedAssets
+          : [];
+      }
 
+      // ---- Any other error ----
       console.error("Mist API Error:", err.message);
       if (err.response) {
         console.error("Status:", err.response.status);
