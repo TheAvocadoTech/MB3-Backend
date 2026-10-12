@@ -72,9 +72,6 @@ const MAP_CONFIGS = {
 // ============================================================
 // AP CORRECTIONS
 // ============================================================
-// rotationOffsetDeg  → rotates the detection vector (not the beam)
-// rssiOffsetDb       → added to raw RSSI before weighting
-// isStaticZoneAnchor → pin to AP coords when RSSI is very strong
 const AP_CORRECTIONS = {
   c878678aa2ab: {
     rotationOffsetDeg: 0,
@@ -809,7 +806,7 @@ class AssetTracker extends EventEmitter {
         }
 
         // =========================================================
-        // ---- Outlier rejection (WITH STREAK RECOVERY) ----
+        // Outlier rejection (with streak recovery)
         // =========================================================
         if (!this.positionHistory.has(mac)) this.positionHistory.set(mac, []);
         const history = this.positionHistory.get(mac);
