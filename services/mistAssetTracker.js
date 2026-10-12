@@ -3,9 +3,8 @@
 //
 //   - Mist API polling (with 429 backoff) + caching
 //   - Local AP list from ap_list.json + AP_CORRECTIONS
-//   - Per-AP RSSI offset + AoA vector rotation + static-anchor pinning
-//   - AoA / beam triangulation  ← uses Mist's "beam" field
-//   - RSSI-weighted AP centroid (fallback / blend)
+//   - Per-AP RSSI offset + detection vector rotation + static-anchor pinning
+//   - RSSI-weighted AP centroid
 //   - Particle filter (or EMA fallback)
 //   - Median outlier rejection  + outlier-streak recovery
 //   - Heatmap density smoothing
@@ -73,15 +72,12 @@ const MAP_CONFIGS = {
 // ============================================================
 // AP CORRECTIONS
 // ============================================================
-// rotationOffsetDeg  → rotates AoA / beam angle AND the detection vector
-//                      ⚠️ Only set this after empirically verifying beam
-//                      direction with a test tag. Wrong value = beam points
-//                      in the opposite direction and tag drifts away.
+// rotationOffsetDeg  → rotates the detection vector (not the beam)
 // rssiOffsetDb       → added to raw RSSI before weighting
 // isStaticZoneAnchor → pin to AP coords when RSSI is very strong
 const AP_CORRECTIONS = {
   c878678aa2ab: {
-    rotationOffsetDeg: 0,      // ← FIXED: was 180 (beam was flipped backwards)
+    rotationOffsetDeg: 0,
     rssiOffsetDb: +4,
     isStaticZoneAnchor: true,
     zoneBounds: { minX: 100, maxX: 115, minY: 25, maxY: 35 },
@@ -221,7 +217,7 @@ class AssetTracker extends EventEmitter {
     this.TOP_APS = options.topAps ?? 3;
     this.STABILITY_THRESHOLD = options.stabilityThreshold ?? 3.0;
     this.OUTLIER_THRESHOLD = options.outlierThreshold ?? 5.0;
-    this.OUTLIER_RECOVERY_STREAK = options.outlierRecoveryStreak ?? 5; // NEW
+    this.OUTLIER_RECOVERY_STREAK = options.outlierRecoveryStreak ?? 5;
     this.MIN_MOVE_METERS = options.minMoveMeters ?? 0.5;
     this.MAX_SPEED_MS = options.maxSpeedMs ?? 2.0;
     this.MIN_RSSI = options.minRssi ?? -75;
@@ -255,14 +251,6 @@ class AssetTracker extends EventEmitter {
     this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;
     this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
     this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
-
-    // --- AoA / beam triangulation ---
-    this.USE_BEAM_TRIANGULATION = options.useBeamTriangulation ?? true;
-    this.BEAM_WIDTH_DEG = options.beamWidthDeg ?? 30;
-    this.BEAM_ZERO_OFFSET_DEG = options.beamZeroOffsetDeg ?? 0;
-    this.BEAM_WEIGHT = options.beamWeight ?? 0.75;
-    this.BEAM_MAX_RAY_M = options.beamMaxRayM ?? 40;
-    this.BEAM_MIN_ANGLE_DEG = options.beamMinAngleDeg ?? 25;
 
     // --- Backoff / cache ---
     this.backoffUntil = 0;
@@ -358,8 +346,7 @@ class AssetTracker extends EventEmitter {
         rssi: state.currentAP?.rssi || state.bestRSSI || null,
         raw_rssi: state.lastRawRssi || null,
         apHistory: state.apHistory?.slice(-5) || [],
-        triangulation: state.lastTriangulation || null,
-        outlierStreak: state.outlierStreak || 0,     // NEW
+        outlierStreak: state.outlierStreak || 0,
       };
     }
     return states;
@@ -450,7 +437,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Preprocess a single AP detection (AoA vector rotation only)
+  // Preprocess a single AP detection (vector rotation only)
   // ============================================================
   _preprocessDetection(apMac, rawX, rawY, rawRssi) {
     const ap = this.apMap.get(apMac);
@@ -483,111 +470,6 @@ class AssetTracker extends EventEmitter {
       return { x: ap.x_m, y: ap.y_m };
     }
     return { x, y };
-  }
-
-  // ============================================================
-  // ✨ AoA / beam triangulation
-  // ============================================================
-  _beamToAbsoluteAngleRad(beamIdx, apOrientationDeg) {
-    const deg =
-      beamIdx * this.BEAM_WIDTH_DEG +
-      (apOrientationDeg || 0) +
-      this.BEAM_ZERO_OFFSET_DEG;
-    return (deg * Math.PI) / 180;
-  }
-
-  _rayIntersection(A, Da, B, Db) {
-    const denom = Da.x * Db.y - Da.y * Db.x;
-    if (Math.abs(denom) < 1e-6) return null;
-
-    const ex = B.x - A.x;
-    const ey = B.y - A.y;
-
-    const t = (ex * Db.y - ey * Db.x) / denom;
-    const s = (ex * Da.y - ey * Da.x) / denom;
-
-    if (t <= 0 || s <= 0) return null;
-    if (t > this.BEAM_MAX_RAY_M || s > this.BEAM_MAX_RAY_M) return null;
-
-    return { x: A.x + t * Da.x, y: A.y + t * Da.y, tDist: t, sDist: s };
-  }
-
-  _triangulateWithBeams(detections) {
-    if (!this.USE_BEAM_TRIANGULATION) return null;
-
-    const beamObs = [];
-    for (const det of detections) {
-      if (det.beam == null) continue;
-      if (!det.ap_mac) continue;
-      const ap = this.apMap.get(det.ap_mac);
-      if (!ap) continue;
-
-      const beamIdx = Number(det.beam);
-      if (!Number.isFinite(beamIdx)) continue;
-      if (beamIdx < 0 || beamIdx > 23) continue;
-
-      const correctedRssi = det.rssi + (ap.rssiOffset || 0);
-      beamObs.push({
-        apMac: det.ap_mac,
-        ap,
-        beamIdx,
-        correctedRssi,
-      });
-    }
-
-    if (beamObs.length < 2) return null;
-
-    const pairs = [];
-    for (let i = 0; i < beamObs.length; i++) {
-      for (let j = i + 1; j < beamObs.length; j++) {
-        const a = beamObs[i];
-        const b = beamObs[j];
-        if (a.apMac === b.apMac) continue;
-
-        const angA = this._beamToAbsoluteAngleRad(a.beamIdx, a.ap.orientation);
-        const angB = this._beamToAbsoluteAngleRad(b.beamIdx, b.ap.orientation);
-
-        let dAng = Math.abs(angA - angB) * 180 / Math.PI;
-        dAng = Math.min(dAng, 360 - dAng);
-        if (dAng < this.BEAM_MIN_ANGLE_DEG) continue;
-
-        const A = { x: a.ap.x_m, y: a.ap.y_m };
-        const B = { x: b.ap.x_m, y: b.ap.y_m };
-        const Da = { x: Math.cos(angA), y: Math.sin(angA) };
-        const Db = { x: Math.cos(angB), y: Math.sin(angB) };
-
-        const hit = this._rayIntersection(A, Da, B, Db);
-        if (!hit) continue;
-
-        const pairWeight = Math.pow(10, (a.correctedRssi + b.correctedRssi) / 20);
-        pairs.push({ x: hit.x, y: hit.y, weight: pairWeight, dAng });
-      }
-    }
-
-    if (pairs.length === 0) return null;
-
-    let sumX = 0, sumY = 0, sumW = 0;
-    for (const p of pairs) {
-      sumX += p.x * p.weight;
-      sumY += p.y * p.weight;
-      sumW += p.weight;
-    }
-    if (sumW === 0) return null;
-    const x_m = sumX / sumW;
-    const y_m = sumY / sumW;
-
-    let variance = 0;
-    for (const p of pairs) {
-      variance += this._distance(p.x, p.y, x_m, y_m) ** 2;
-    }
-    variance /= pairs.length;
-    const stdDev = Math.sqrt(variance);
-
-    const spreadConf = Math.max(0, 1 - stdDev / 8);
-    const countConf = Math.min(1, pairs.length / 4);
-    const confidence = 0.6 * spreadConf + 0.4 * countConf;
-
-    return { x_m, y_m, confidence, pairs: pairs.length, stdDev };
   }
 
   // ============================================================
@@ -672,8 +554,7 @@ class AssetTracker extends EventEmitter {
             particleFilter: null,
             isMoving: false,
             positionTrail: [],
-            lastTriangulation: null,
-            outlierStreak: 0,        // NEW
+            outlierStreak: 0,
           };
           if (this.USE_PARTICLE_FILTER) {
             state.particleFilter = new ParticleFilter(
@@ -791,125 +672,79 @@ class AssetTracker extends EventEmitter {
         }
 
         // =========================================================
-        // STEP 1 — RSSI-weighted AP centroid (fallback / blend source)
-        // =========================================================
-        let rssiCentroidX = null;
-        let rssiCentroidY = null;
-        {
-          const apPositions = [];
-          for (const det of detections) {
-            const apMac = det.ap_mac;
-            const apInfo = this.apMap.get(apMac);
-
-            if (!apInfo) {
-              const coords = this._convertCoordinates(det.x, det.y, det.map_id);
-              if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
-                const pre = this._preprocessDetection(
-                  apMac, coords.x_m, coords.y_m, det.rssi
-                );
-                apPositions.push({
-                  x_m: pre.x_m, y_m: pre.y_m,
-                  weight: Math.pow(10, pre.correctedRssi / 10),
-                });
-              }
-              continue;
-            }
-
-            const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
-            apPositions.push({
-              x_m: apInfo.x_m, y_m: apInfo.y_m,
-              weight: Math.pow(10, correctedRssi / 10),
-            });
-          }
-
-          if (apPositions.length > 0) {
-            let sumX = 0, sumY = 0, sumW = 0;
-            for (const p of apPositions) {
-              sumX += p.x_m * p.weight;
-              sumY += p.y_m * p.weight;
-              sumW += p.weight;
-            }
-            if (sumW > 0) {
-              rssiCentroidX = sumX / sumW;
-              rssiCentroidY = sumY / sumW;
-            }
-          }
-
-          if (rssiCentroidX === null || rssiCentroidY === null) {
-            const topAps = sortedAPs.slice(0, this.TOP_APS);
-            let mX = 0, mY = 0, mW = 0;
-            for (const { apMac, smoothedRssi } of topAps) {
-              const det = detectionsMap.get(apMac);
-              if (!det) continue;
-              const coords = this._convertCoordinates(det.x, det.y, det.map_id);
-              if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
-                continue;
-              const pre = this._preprocessDetection(
-                apMac, coords.x_m, coords.y_m, smoothedRssi
-              );
-              const w = Math.pow(10, pre.correctedRssi / 10);
-              mX += pre.x_m * w;
-              mY += pre.y_m * w;
-              mW += w;
-            }
-            if (mW > 0) {
-              rssiCentroidX = mX / mW;
-              rssiCentroidY = mY / mW;
-            } else {
-              const primaryInfo = this.apMap.get(primaryAP.apMac);
-              if (primaryInfo) {
-                rssiCentroidX = primaryInfo.x_m;
-                rssiCentroidY = primaryInfo.y_m;
-              }
-            }
-          }
-        }
-
-        // =========================================================
-        // STEP 2 — AoA / beam triangulation
-        // =========================================================
-        const beamResult = this._triangulateWithBeams(detections);
-        state.lastTriangulation = beamResult
-          ? {
-              x_m: beamResult.x_m,
-              y_m: beamResult.y_m,
-              confidence: beamResult.confidence,
-              pairs: beamResult.pairs,
-              stdDev: beamResult.stdDev,
-            }
-          : null;
-
-        // =========================================================
-        // STEP 3 — Combine beam + RSSI centroid
+        // RSSI-weighted AP centroid
         // =========================================================
         let measurementX = null;
         let measurementY = null;
+        const apPositions = [];
 
-        const haveBeam =
-          beamResult && rssiCentroidX !== null && rssiCentroidY !== null;
-        const haveOnlyBeam =
-          beamResult && (rssiCentroidX === null || rssiCentroidY === null);
-        const haveOnlyRssi =
-          !beamResult && rssiCentroidX !== null && rssiCentroidY !== null;
+        for (const det of detections) {
+          const apMac = det.ap_mac;
+          const apInfo = this.apMap.get(apMac);
 
-        if (haveBeam) {
-          const w = this.BEAM_WEIGHT * (0.5 + 0.5 * beamResult.confidence);
-          measurementX = w * beamResult.x_m + (1 - w) * rssiCentroidX;
-          measurementY = w * beamResult.y_m + (1 - w) * rssiCentroidY;
+          if (!apInfo) {
+            const coords = this._convertCoordinates(det.x, det.y, det.map_id);
+            if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
+              const pre = this._preprocessDetection(
+                apMac, coords.x_m, coords.y_m, det.rssi
+              );
+              apPositions.push({
+                x_m: pre.x_m, y_m: pre.y_m,
+                weight: Math.pow(10, pre.correctedRssi / 10),
+              });
+            }
+            continue;
+          }
 
-          console.log(
-            `📐 AoA triangulation for ${mac}: conf=${beamResult.confidence.toFixed(
-              2
-            )}, pairs=${beamResult.pairs}, stdDev=${beamResult.stdDev.toFixed(2)}m`
-          );
-        } else if (haveOnlyBeam) {
-          measurementX = beamResult.x_m;
-          measurementY = beamResult.y_m;
-        } else if (haveOnlyRssi) {
-          measurementX = rssiCentroidX;
-          measurementY = rssiCentroidY;
-        } else {
-          continue;
+          const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
+          apPositions.push({
+            x_m: apInfo.x_m, y_m: apInfo.y_m,
+            weight: Math.pow(10, correctedRssi / 10),
+          });
+        }
+
+        if (apPositions.length > 0) {
+          let sumX = 0, sumY = 0, sumW = 0;
+          for (const p of apPositions) {
+            sumX += p.x_m * p.weight;
+            sumY += p.y_m * p.weight;
+            sumW += p.weight;
+          }
+          if (sumW > 0) {
+            measurementX = sumX / sumW;
+            measurementY = sumY / sumW;
+          }
+        }
+
+        if (measurementX === null || measurementY === null) {
+          const topAps = sortedAPs.slice(0, this.TOP_APS);
+          let mX = 0, mY = 0, mW = 0;
+          for (const { apMac, smoothedRssi } of topAps) {
+            const det = detectionsMap.get(apMac);
+            if (!det) continue;
+            const coords = this._convertCoordinates(det.x, det.y, det.map_id);
+            if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
+              continue;
+            const pre = this._preprocessDetection(
+              apMac, coords.x_m, coords.y_m, smoothedRssi
+            );
+            const w = Math.pow(10, pre.correctedRssi / 10);
+            mX += pre.x_m * w;
+            mY += pre.y_m * w;
+            mW += w;
+          }
+          if (mW > 0) {
+            measurementX = mX / mW;
+            measurementY = mY / mW;
+          } else {
+            const primaryInfo = this.apMap.get(primaryAP.apMac);
+            if (primaryInfo) {
+              measurementX = primaryInfo.x_m;
+              measurementY = primaryInfo.y_m;
+            } else {
+              continue;
+            }
+          }
         }
 
         // ---- Static-anchor pin ----
@@ -989,8 +824,6 @@ class AssetTracker extends EventEmitter {
           if (dist > this.OUTLIER_THRESHOLD) {
             state.outlierStreak = (state.outlierStreak || 0) + 1;
 
-            // If we've been rejecting for N updates in a row, the "history"
-            // itself is the problem — reset it and accept the new measurement.
             if (state.outlierStreak >= this.OUTLIER_RECOVERY_STREAK) {
               console.warn(
                 `♻️ Outlier recovery for ${mac}: ${state.outlierStreak} rejects in a row → resetting history`
@@ -1155,8 +988,7 @@ class AssetTracker extends EventEmitter {
             is_moving: state.isMoving,
             best_rssi: state.bestRSSI,
             timestamp: now,
-            triangulation: state.lastTriangulation,
-            outlierStreak: state.outlierStreak || 0,   // NEW
+            outlierStreak: state.outlierStreak || 0,
             topAps: Array.from(detectionsMap.values()).map((d) => ({
               ap: d.ap_mac,
               rssi: d.rssi,
@@ -1181,8 +1013,7 @@ class AssetTracker extends EventEmitter {
           is_moving: state.isMoving,
           best_rssi: state.bestRSSI,
           ppm,
-          triangulation: state.lastTriangulation,
-          outlierStreak: state.outlierStreak || 0,      // NEW
+          outlierStreak: state.outlierStreak || 0,
         });
 
         if (state.apHistory.length > 0) {
@@ -1268,7 +1099,7 @@ const options = {
   topAps: 3,
   stabilityThreshold: 3.0,
   outlierThreshold: 5.0,
-  outlierRecoveryStreak: 5,     // NEW — reset history after 5 consecutive rejects
+  outlierRecoveryStreak: 5,
   minMoveMeters: 0.5,
   maxSpeedMs: 2.0,
   minRssi: -75,
@@ -1293,18 +1124,10 @@ const options = {
   trailMinMoveM: 0.25,
   trailMaxAgeMs: 5 * 60 * 1000,
   trailEmitPoints: 100,
-
-  // ---- ✨ AoA / beam triangulation ----
-  useBeamTriangulation: true,
-  beamWidthDeg: 30,
-  beamZeroOffsetDeg: 0,
-  beamWeight: 0.75,
-  beamMaxRayM: 40,
-  beamMinAngleDeg: 25,
 };
 
 const assetTracker = new AssetTracker(options);
 console.log(
-  "✅ mistAssetTracker loaded: AoA triangulation + outlier recovery + dynamic trail"
+  "✅ mistAssetTracker loaded: RSSI centroid + outlier recovery + dynamic trail"
 );
 module.exports = assetTracker;
