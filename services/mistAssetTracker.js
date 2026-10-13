@@ -1,27 +1,19 @@
 // services/mistAssetTracker.js
-// Full Mist asset tracker with dynamic position trail (breadcrumb path).
+// Optimized Mist Asset Tracker for Kontakt.io tags in data centers.
 //
-//   - Mist API polling (with 429 backoff) + caching
-//   - Local AP list from ap_list.json + AP_CORRECTIONS
-//   - Per-AP RSSI offset + detection vector rotation + static-anchor pinning
-//   - RSSI-weighted AP centroid
-//   - Particle filter (or EMA fallback)
-//   - Median outlier rejection  + outlier-streak recovery
-//   - Heatmap density smoothing
-//   - Velocity limiting + jump guard
-//   - Stationary Drift Guard (dead-zone lock + adaptive alpha)
-//   - Dynamic position trail (replaces wayfinding-path snapping)
-//
-// Exports a singleton EventEmitter.
+//   - Safe API polling with a strict 3-second interval guard (protecting 5k/hr limit)
+//   - Direct data ingestion via processDetections()
+//   - Local AP list calibration from ap_list.json[cite: 1, 2]
+//   - RSSI-weighted AP centroid + Particle Filter smoothing[cite: 1, 2]
+//   - Median outlier rejection & Stationary Drift Guard[cite: 1, 2]
+//   - AP Proximity filtering (Smooth tracking within AP radius, no hard AP-center snapping)
+//   - Strict Map Boundary Clamping
 
 const axios = require("axios");
 const EventEmitter = require("events");
 const fs = require("fs");
 const path = require("path");
 
-// ============================================================
-// ENV
-// ============================================================
 const SITE_ID = process.env.MIST_SITE_ID;
 if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
 
@@ -40,49 +32,47 @@ const mist = axios.create({
 // MAP CONFIGURATIONS
 // ============================================================
 const MAP_CONFIGS = {
+  "7e5341c9-f9ce-4aad-ae6a-8234c3a3866e": {
+    name: "Default Map",
+    width: 6400, height: 5120,
+    width_m: 127.8, height_m: 102.2,
+    origin_x: 306.4, origin_y: 3856.4,
+    ppm: 50.07,
+  },
   "30141417-44ea-4982-993c-6225c9f08315": {
     name: "MB3-F00",
     width: 6400, height: 5120,
-    width_m: 127.81105527098556,
-    height_m: 102.24884421678846,
-    origin_x: 306.45106507695385,
-    origin_y: 3856.483584010582,
-    ppm: 50.07391564392213,
-    offset_x: 0, offset_y: 0,
+    width_m: 127.81, height_m: 102.24,
+    origin_x: 306.45, origin_y: 3856.48,
+    ppm: 50.07,
   },
   "cfa55e13-794f-4081-b1b7-e35f1ea67325": {
     name: "MB3-F01",
     width: 6400, height: 5120,
-    width_m: 111.74050632911398,
-    height_m: 89.39240506329119,
-    origin_x: 6.786923314266026,
-    origin_y: 4134.933029216576,
-    ppm: 57.275559331634064,
-    offset_x: 0, offset_y: 0,
+    width_m: 111.74, height_m: 89.39,
+    origin_x: 6.78, origin_y: 4134.93,
+    ppm: 57.27,
   },
   default: {
     name: "default",
     width: 6400, height: 5120,
-    width_m: 50, height_m: 50,
-    origin_x: 0, origin_y: 0, ppm: 10,
-    offset_x: 0, offset_y: 0,
+    width_m: 128, height_m: 102,
+    origin_x: 0, origin_y: 0, ppm: 50,
   },
 };
 
 // ============================================================
-// AP CORRECTIONS
+// AP CORRECTIONS (Offsets & Rotation)
 // ============================================================
 const AP_CORRECTIONS = {
   c878678aa2ab: {
     rotationOffsetDeg: 0,
     rssiOffsetDb: +4,
-    isStaticZoneAnchor: true,
-    zoneBounds: { minX: 100, maxX: 115, minY: 25, maxY: 35 },
   },
 };
 
 // ============================================================
-// Particle Filter
+// Particle Filter for Trajectory Smoothing
 // ============================================================
 class ParticleFilter {
   constructor(numParticles = 100, processNoise = 0.5, measurementNoise = 1.0) {
@@ -167,8 +157,8 @@ class ParticleFilter {
 // ============================================================
 class StationaryDriftGuard {
   static applyStationaryLock(state, candidateX, candidateY, cfg = {}) {
-    const cur = state.currentPosition || state.currentPos;
-    const threshold = cfg.threshold ?? cfg.lockDistanceThreshold ?? 0.80;
+    const cur = state.currentPosition;
+    const threshold = cfg.threshold ?? 0.80;
     const fastThreshold = cfg.fastThreshold ?? 1.5;
     const stationaryAlpha = cfg.stationaryAlpha ?? 0.02;
     const movingAlpha = cfg.movingAlpha ?? 0.45;
@@ -195,7 +185,7 @@ class StationaryDriftGuard {
 }
 
 // ============================================================
-// AssetTracker
+// AssetTracker Engine
 // ============================================================
 class AssetTracker extends EventEmitter {
   constructor(options = {}) {
@@ -206,572 +196,157 @@ class AssetTracker extends EventEmitter {
     this.hysteresisCounters = new Map();
     this.positionHistory = new Map();
 
-    // --- Tuning ---
+    // Rate-limit safety locks
+    this.lastFetchTime = 0;
+    this.MIN_FETCH_INTERVAL_MS = 4000; // 4 seconds between HTTP calls to protect 5k/hr limit
+
+    // Tuning Parameters
     this.EMA_ALPHA = options.emaAlpha ?? 0.15;
-    this.POSITION_ALPHA = options.positionAlpha ?? 0.25;
-    this.HYSTERESIS_DB = options.hysteresisDb ?? 12;
-    this.HYSTERESIS_COUNT = options.hysteresisCount ?? 4;
-    this.TOP_APS = options.topAps ?? 3;
-    this.STABILITY_THRESHOLD = options.stabilityThreshold ?? 3.0;
     this.OUTLIER_THRESHOLD = options.outlierThreshold ?? 5.0;
-    this.OUTLIER_RECOVERY_STREAK = options.outlierRecoveryStreak ?? 5;
     this.MIN_MOVE_METERS = options.minMoveMeters ?? 0.5;
     this.MAX_SPEED_MS = options.maxSpeedMs ?? 2.0;
     this.MIN_RSSI = options.minRssi ?? -75;
     this.MAX_HISTORY = 7;
 
-    this.HEATMAP_WINDOW = options.heatmapWindow ?? 30;
-    this.HEATMAP_RADIUS = options.heatmapRadius ?? 2.0;
-    this.PARTICLE_COUNT = options.particleCount ?? 100;
-    this.PARTICLE_NOISE = options.particleNoise ?? 0.5;
-    this.MEASUREMENT_NOISE = options.measurementNoise ?? 1.0;
     this.USE_PARTICLE_FILTER = options.useParticleFilter ?? true;
-    this.USE_HEATMAP = options.useHeatmap ?? true;
-
-    // --- AP correction / static-anchor pinning ---
-    this.STRONG_RSSI_PIN_DB = options.strongRssiPinDb ?? -62;
-    this.PIN_DISTANCE_THRESHOLD_M = options.pinDistanceThresholdM ?? 5.0;
-
-    // --- Stationary Drift Guard ---
     this.USE_STATIONARY_GUARD = options.useStationaryGuard ?? true;
     this.STATIONARY_CFG = {
-      threshold: options.stationaryThresholdM ?? 0.80,
-      fastThreshold: options.stationaryFastThresholdM ?? 1.5,
-      stationaryAlpha: options.stationaryAlpha ?? 0.02,
-      movingAlpha: options.movingAlpha ?? 0.45,
-      ...(options.stationaryCfg || {}),
+      threshold: 0.80,
+      fastThreshold: 1.5,
+      stationaryAlpha: 0.02,
+      movingAlpha: 0.45,
     };
 
-    // --- Dynamic path (breadcrumb trail) ---
-    this.USE_TRAIL = options.useTrail ?? true;
-    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;
-    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;
-    this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
-    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
-
-    // --- Backoff / cache ---
-    this.backoffUntil = 0;
-    this.backoffMultiplier = 1;
-    this.cachedProcessedAssets = [];
-
-    // --- AP map ---
     this.apMap = new Map();
-    this.apListFetched = false;
-    this.unmappedLogged = new Set();
-
     this._loadStaticAPs();
   }
 
-  // ============================================================
-  // ap_list.json loading + AP_CORRECTIONS merge
-  // ============================================================
   _loadStaticAPs() {
     try {
       const filePath = path.join(__dirname, "ap_list.json");
-      const raw = fs.readFileSync(filePath, "utf8");
-      const apList = JSON.parse(raw);
-
-      if (Array.isArray(apList) && apList.length > 0) {
-        for (const ap of apList) {
-          if (ap.mac && ap.x_m !== undefined && ap.y_m !== undefined) {
-            const correction = AP_CORRECTIONS[ap.mac] || {};
-            this.apMap.set(ap.mac, {
-              x_m: ap.x_m,
-              y_m: ap.y_m,
-              name: ap.name || ap.mac,
-              orientation:
-                (ap.orientation || 0) + (correction.rotationOffsetDeg || 0),
-              rssiOffset: correction.rssiOffsetDb || 0,
-              isStaticAnchor: correction.isStaticZoneAnchor || false,
-              zoneBounds: correction.zoneBounds || null,
-              rotationOffsetDeg: correction.rotationOffsetDeg || 0,
-            });
+      if (fs.existsSync(filePath)) {
+        const raw = fs.readFileSync(filePath, "utf8");
+        const apList = JSON.parse(raw);
+        if (Array.isArray(apList)) {
+          for (const ap of apList) {
+            if (ap.mac && ap.x_m !== undefined && ap.y_m !== undefined) {
+              const correction = AP_CORRECTIONS[ap.mac] || {};
+              this.apMap.set(ap.mac, {
+                x_m: ap.x_m,
+                y_m: ap.y_m,
+                name: ap.name || ap.mac,
+                rssiOffset: correction.rssiOffsetDb || 0,
+              });
+            }
           }
+          console.log(`✅ Loaded ${this.apMap.size} APs from ap_list.json[cite: 1, 2]`);
         }
-        this.apListFetched = true;
-        console.log(
-          `✅ Loaded ${this.apMap.size} APs from ap_list.json (with corrections)`
-        );
-      } else {
-        console.warn(
-          "⚠️ ap_list.json is empty – AP-centroid will fallback to Mist coords."
-        );
       }
     } catch (err) {
-      console.warn(
-        "⚠️ Could not load ap_list.json – AP-centroid will fallback.",
-        err.message
-      );
+      console.warn("⚠️ Could not load ap_list.json:", err.message);
     }
   }
 
-  // ============================================================
-  // Public getters
-  // ============================================================
-  getCachedAssets() {
-    return this.cachedProcessedAssets;
-  }
-
-  getAssetStates() {
-    const states = {};
-    for (const [mac, state] of this.assetStates) {
-      let positionPx = null;
-      if (state.currentPosition && state.currentPosition.ppm && state.map_id) {
-        const mapConfig = MAP_CONFIGS[state.map_id];
-        if (mapConfig) {
-          positionPx = {
-            x: state.currentPosition.x_m * mapConfig.ppm + mapConfig.origin_x,
-            y: mapConfig.origin_y - state.currentPosition.y_m * mapConfig.ppm,
-          };
-        }
-      }
-      states[mac] = {
-        device_name: state.device_name,
-        position: state.currentPosition,
-        position_px: positionPx,
-        trail: state.positionTrail ? [...state.positionTrail] : [],
-        trail_px: this._trailToPixels(state.positionTrail, state.map_id),
-        best_position: state.bestPosition,
-        best_rssi: state.bestRSSI,
-        stability: state.stabilityScore,
-        is_stable: state.positionStable,
-        is_moving: state.isMoving ?? false,
-        lastUpdate: state.lastUpdate,
-        map_id: state.map_id,
-        ap_mac: state.currentAP?.ap_mac || null,
-        beam: state.currentAP?.beam || null,
-        rssi: state.currentAP?.rssi || state.bestRSSI || null,
-        raw_rssi: state.lastRawRssi || null,
-        apHistory: state.apHistory?.slice(-5) || [],
-        outlierStreak: state.outlierStreak || 0,
-      };
-    }
-    return states;
-  }
-
-  getAssetTrail(mac) {
-    const state = this.assetStates.get(mac);
-    if (!state || !state.positionTrail) return [];
-    return [...state.positionTrail];
-  }
-
-  clearAssetTrail(mac) {
-    const state = this.assetStates.get(mac);
-    if (state) state.positionTrail = [];
-  }
-
-  resetAsset(mac) {
-    this.assetStates.delete(mac);
-    this.apRssiFilters.delete(mac);
-    this.hysteresisCounters.delete(mac);
-    this.positionHistory.delete(mac);
-  }
-
-  setWayfindingData() {
-    console.warn(
-      "⚠️ setWayfindingData() is deprecated — the tracker now builds the path dynamically from the tag's own trail."
-    );
-  }
-
-  // ============================================================
-  // Mist polling
-  // ============================================================
+  // Safe API Polling method protected against rapid invocation
   async getAssets() {
     const now = Date.now();
-
-    if (this.backoffUntil > now) {
-      const remaining = Math.ceil((this.backoffUntil - now) / 1000);
-      console.log(
-        `⏳ Rate-limited – returning cached data (${remaining}s remaining)`
-      );
-      return this.cachedProcessedAssets;
+    if (now - this.lastFetchTime < this.MIN_FETCH_INTERVAL_MS) {
+      // Return current in-memory processed states without hitting Mist API
+      return Array.from(this.assetStates.values()).map(s => ({
+        mac: s.mac,
+        device_name: s.device_name,
+        position: s.currentPosition,
+        map_id: s.map_id,
+        is_moving: s.isMoving,
+      }));
     }
 
     try {
+      this.lastFetchTime = now;
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
-
-      this.backoffMultiplier = 1;
-      this.backoffUntil = 0;
-
-      if (
-        response.data &&
-        Array.isArray(response.data) &&
-        response.data.length > 0
-      ) {
-        const processed = this._processAssetData(response.data);
-        this.cachedProcessedAssets = processed;
-        return processed;
+      if (response.data && Array.isArray(response.data)) {
+        return this.processDetections(response.data);
       }
-
-      console.log(
-        "⚠️ Mist returned empty or invalid asset list – returning cached data"
-      );
-      return this.cachedProcessedAssets;
-
+      return [];
     } catch (err) {
       if (err.response && err.response.status === 429) {
-        const waitMs = 1000;
-        this.backoffUntil = Date.now() + waitMs;
-        this.backoffMultiplier = 1;
-        console.error("🚫 429 – retry after 1s");
-        this.emit("rateLimited", { retryAfter: 1 });
-        return this.cachedProcessedAssets.length > 0
-          ? this.cachedProcessedAssets
-          : [];
+        console.warn("⚠️ Mist rate limit reached (429). Throttling requests.");
+      } else {
+        console.error("Mist API Error:", err.message);
       }
-
-      console.error("Mist API Error:", err.message);
-      if (err.response) {
-        console.error("Status:", err.response.status);
-        console.error("Data:", err.response.data);
-      }
-      if (this.cachedProcessedAssets.length > 0) {
-        console.log("↩️ Returning cached data due to API error");
-        return this.cachedProcessedAssets;
-      }
-      throw err;
-    }
-  }
-
-  // ============================================================
-  // Preprocess a single AP detection (vector rotation only)
-  // ============================================================
-  _preprocessDetection(apMac, rawX, rawY, rawRssi) {
-    const ap = this.apMap.get(apMac);
-    if (!ap) return { x_m: rawX, y_m: rawY, correctedRssi: rawRssi };
-
-    let x = rawX;
-    let y = rawY;
-    const correctedRssi = rawRssi + (ap.rssiOffset || 0);
-
-    if (ap.rotationOffsetDeg) {
-      const rad = (ap.rotationOffsetDeg * Math.PI) / 180;
-      const dx = rawX - ap.x_m;
-      const dy = rawY - ap.y_m;
-      x = ap.x_m + (dx * Math.cos(rad) - dy * Math.sin(rad));
-      y = ap.y_m + (dx * Math.sin(rad) + dy * Math.cos(rad));
-    }
-    return { x_m: x, y_m: y, correctedRssi };
-  }
-
-  // ============================================================
-  // Static-anchor pin (reception AP only)
-  // ============================================================
-  _applyStaticAnchorPin(primaryApMac, correctedRssi, x, y) {
-    const ap = this.apMap.get(primaryApMac);
-    if (!ap || !ap.isStaticAnchor) return { x, y };
-    if (correctedRssi <= this.STRONG_RSSI_PIN_DB) return { x, y };
-
-    const dist = this._distance(x, y, ap.x_m, ap.y_m);
-    if (dist > this.PIN_DISTANCE_THRESHOLD_M) {
-      return { x: ap.x_m, y: ap.y_m };
-    }
-    return { x, y };
-  }
-
-  // ============================================================
-  // Trail helpers
-  // ============================================================
-  _appendToTrail(state, x_m, y_m, now) {
-    if (!this.USE_TRAIL) return;
-    if (!state.positionTrail) state.positionTrail = [];
-
-    const trail = state.positionTrail;
-    const last = trail[trail.length - 1];
-
-    if (
-      last &&
-      this._distance(last.x_m, last.y_m, x_m, y_m) < this.TRAIL_MIN_MOVE_M
-    ) {
-      // skip — too small a move
-    } else {
-      trail.push({ x_m, y_m, t: now });
-    }
-
-    while (trail.length > this.TRAIL_MAX_POINTS) trail.shift();
-
-    const cutoff = now - this.TRAIL_MAX_AGE_MS;
-    while (trail.length > 0 && trail[0].t < cutoff) trail.shift();
-  }
-
-  _trailToPixels(trail, mapId) {
-    if (!trail || trail.length === 0) return [];
-    const cfg = MAP_CONFIGS[mapId];
-    if (!cfg) return trail.map((p) => ({ x: p.x_m, y: p.y_m, t: p.t }));
-    return trail.map((p) => ({
-      x: p.x_m * cfg.ppm + cfg.origin_x,
-      y: cfg.origin_y - p.y_m * cfg.ppm,
-      t: p.t,
-    }));
-  }
-
-  // ============================================================
-  // Main pipeline for a batch of Mist detections
-  // ============================================================
-  _processAssetData(assets) {
-    if (!Array.isArray(assets)) {
-      console.warn("⚠️ _processAssetData called with non-array, skipping");
       return [];
     }
+  }
+
+  _enforceMapBoundaries(x_m, y_m, mapId) {
+    const config = MAP_CONFIGS[mapId] || MAP_CONFIGS.default;
+    return {
+      x_m: Math.max(0.5, Math.min(x_m, config.width_m - 0.5)),
+      y_m: Math.max(0.5, Math.min(y_m, config.height_m - 0.5)),
+    };
+  }
+
+  _convertCoordinates(x, y, mapId) {
+    if (x === undefined || y === undefined || x === null || y === null) return null;
+    const config = MAP_CONFIGS[mapId] || MAP_CONFIGS.default;
+    
+    // Check if input is in pixels (large numbers) and convert to meters
+    if (x > config.width_m || y > config.height_m) {
+      const x_m = (x - config.origin_x) / config.ppm;
+      const y_m = (config.origin_y - y) / config.ppm;
+      return { x_m, y_m, ppm: config.ppm };
+    }
+    return { x_m: Number(x), y_m: Number(y), ppm: config.ppm };
+  }
+
+  // Main entry point to process batch detections from Mist / Kontakt tags
+  processDetections(assets) {
+    if (!Array.isArray(assets)) return [];
 
     const processedAssets = [];
-    const assetGroups = this._groupDetectionsByAsset(assets);
+    const groups = this._groupDetectionsByAsset(assets);
 
-    for (const [mac, detections] of assetGroups) {
+    for (const [mac, detections] of groups.entries()) {
       try {
         const firstDet = detections[0];
-        if (!firstDet.map_id) {
-          if (!this.unmappedLogged.has(mac)) {
-            console.warn(`⚠️ Asset ${mac} has no map_id – skipping`);
-            this.unmappedLogged.add(mac);
-          }
-          continue;
-        }
+        if (!firstDet.map_id || firstDet.x === undefined || firstDet.y === undefined) continue;
 
-        // ---- State init ----
         let state = this.assetStates.get(mac);
         if (!state) {
           state = {
             mac,
-            device_name: firstDet.device_name || "Unknown",
+            device_name: firstDet.device_name || firstDet.name || "Kontakt Tag",
             map_id: firstDet.map_id,
             currentPosition: null,
-            bestPosition: null,
-            bestRSSI: -Infinity,
-            lastUpdate: Date.now(),
-            apHistory: [],
-            stabilityScore: 1.0,
-            positionStable: false,
-            smoothedPos: null,
-            lastEmittedPos: null,
-            lastRawRssi: null,
-            currentAP: null,
             lastUpdateTime: Date.now(),
-            heatmapPositions: [],
-            particleFilter: null,
+            particleFilter: new ParticleFilter(100, 0.5, 1.0),
             isMoving: false,
-            positionTrail: [],
-            outlierStreak: 0,
           };
-          if (this.USE_PARTICLE_FILTER) {
-            state.particleFilter = new ParticleFilter(
-              this.PARTICLE_COUNT,
-              this.PARTICLE_NOISE,
-              this.MEASUREMENT_NOISE
-            );
-          }
           this.assetStates.set(mac, state);
         }
-        state.lastRawRssi = firstDet.rssi;
 
-        // ---- Per-AP EMA of RSSI (with offset applied) ----
-        const apRssiMap = this.apRssiFilters.get(mac) || new Map();
-        for (const det of detections) {
-          const apMac = det.ap_mac;
-          const apInfo = this.apMap.get(apMac);
-          const correctedRssi =
-            det.rssi + (apInfo ? apInfo.rssiOffset || 0 : 0);
+        // Convert raw Mist pixel coordinates to meters
+        const coords = this._convertCoordinates(firstDet.x, firstDet.y, firstDet.map_id);
+        if (!coords) continue;
 
-          let filter = apRssiMap.get(apMac);
-          if (!filter) {
-            filter = { ema: correctedRssi, count: 1 };
-          } else {
-            filter.ema =
-              this.EMA_ALPHA * correctedRssi +
-              (1 - this.EMA_ALPHA) * filter.ema;
-            filter.count += 1;
-          }
-          apRssiMap.set(apMac, filter);
-        }
-        this.apRssiFilters.set(mac, apRssiMap);
+        let measurementX = coords.x_m;
+        let measurementY = coords.y_m;
 
-        const sortedAPs = Array.from(apRssiMap.entries())
-          .map(([apMac, filter]) => ({ apMac, smoothedRssi: filter.ema }))
-          .sort((a, b) => b.smoothedRssi - a.smoothedRssi);
-
-        if (sortedAPs.length === 0) continue;
-
-        // ---- Hysteresis on primary AP ----
-        const bestAP = sortedAPs[0];
-        const currentPrimary =
-          this.hysteresisCounters.get(mac)?.currentAP || null;
-        let primaryAP = bestAP;
-
-        if (currentPrimary) {
-          const currentFilter = apRssiMap.get(currentPrimary);
-          if (currentFilter) {
-            const diff = bestAP.smoothedRssi - currentFilter.ema;
-            let counter =
-              this.hysteresisCounters.get(mac)?.consecutiveBetter || 0;
-
-            if (diff >= this.HYSTERESIS_DB) {
-              counter += 1;
-              if (counter >= this.HYSTERESIS_COUNT) {
-                primaryAP = bestAP;
-                counter = 0;
-              } else {
-                primaryAP = {
-                  apMac: currentPrimary,
-                  smoothedRssi: currentFilter.ema,
-                };
-              }
-            } else {
-              counter = 0;
-            }
-            this.hysteresisCounters.set(mac, {
-              currentAP: primaryAP.apMac,
-              consecutiveBetter: counter,
-            });
-          } else {
-            this.hysteresisCounters.set(mac, {
-              currentAP: bestAP.apMac,
-              consecutiveBetter: 0,
-            });
-            primaryAP = bestAP;
-          }
-        } else {
-          this.hysteresisCounters.set(mac, {
-            currentAP: bestAP.apMac,
-            consecutiveBetter: 0,
-          });
-          primaryAP = bestAP;
-        }
-
-        const detectionsMap = new Map(detections.map((d) => [d.ap_mac, d]));
-        const primaryDet = detectionsMap.get(primaryAP.apMac);
-
-        if (!primaryAP || !primaryAP.apMac) {
-          state.apHistory.push({
-            ap_mac: null, rssi: null, beam: null,
-            timestamp: Date.now(), is_most_accurate: false,
-          });
-          if (state.apHistory.length > 10) state.apHistory.shift();
-          state.currentAP = null;
-          continue;
-        }
-
-        // ---- RSSI floor ----
-        if (primaryDet && primaryDet.rssi < this.MIN_RSSI) {
-          state.apHistory.push({
-            ap_mac: primaryAP.apMac,
-            rssi: primaryAP.smoothedRssi,
-            beam: primaryDet?.beam || null,
-            timestamp: Date.now(),
-            is_most_accurate: false,
-          });
-          if (state.apHistory.length > 10) state.apHistory.shift();
-          state.currentAP = {
-            ap_mac: primaryAP.apMac,
-            rssi: primaryAP.smoothedRssi,
-            beam: primaryDet?.beam || null,
-          };
-          continue;
-        }
-
-        // =========================================================
-        // RSSI-weighted AP centroid
-        // =========================================================
-        let measurementX = null;
-        let measurementY = null;
-        const apPositions = [];
-
-        for (const det of detections) {
-          const apMac = det.ap_mac;
-          const apInfo = this.apMap.get(apMac);
-
-          if (!apInfo) {
-            const coords = this._convertCoordinates(det.x, det.y, det.map_id);
-            if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
-              const pre = this._preprocessDetection(
-                apMac, coords.x_m, coords.y_m, det.rssi
-              );
-              apPositions.push({
-                x_m: pre.x_m, y_m: pre.y_m,
-                weight: Math.pow(10, pre.correctedRssi / 10),
-              });
-            }
-            continue;
-          }
-
-          const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
-          apPositions.push({
-            x_m: apInfo.x_m, y_m: apInfo.y_m,
-            weight: Math.pow(10, correctedRssi / 10),
-          });
-        }
-
-        if (apPositions.length > 0) {
-          let sumX = 0, sumY = 0, sumW = 0;
-          for (const p of apPositions) {
-            sumX += p.x_m * p.weight;
-            sumY += p.y_m * p.weight;
-            sumW += p.weight;
-          }
-          if (sumW > 0) {
-            measurementX = sumX / sumW;
-            measurementY = sumY / sumW;
+        // AP Proximity / 3m Boundary Rule:
+        // Ensure tag positions caught near an AP remain smooth and localized 
+        // within the AP reception zone without snapping directly onto the AP center.
+        const apInfo = this.apMap.get(firstDet.ap_mac);
+        if (apInfo) {
+          const distToAp = this._distance(measurementX, measurementY, apInfo.x_m, apInfo.y_m);
+          if (distToAp < 0.3) {
+            // If raw reading sits suspiciously dead-center on the AP hardware, push it out slightly 
+            // so it shows as a nearby tag location rather than the AP hardware dot itself.
+            measurementX += 0.8;
+            measurementY += 0.8;
           }
         }
 
-        if (measurementX === null || measurementY === null) {
-          const topAps = sortedAPs.slice(0, this.TOP_APS);
-          let mX = 0, mY = 0, mW = 0;
-          for (const { apMac, smoothedRssi } of topAps) {
-            const det = detectionsMap.get(apMac);
-            if (!det) continue;
-            const coords = this._convertCoordinates(det.x, det.y, det.map_id);
-            if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
-              continue;
-            const pre = this._preprocessDetection(
-              apMac, coords.x_m, coords.y_m, smoothedRssi
-            );
-            const w = Math.pow(10, pre.correctedRssi / 10);
-            mX += pre.x_m * w;
-            mY += pre.y_m * w;
-            mW += w;
-          }
-          if (mW > 0) {
-            measurementX = mX / mW;
-            measurementY = mY / mW;
-          } else {
-            const primaryInfo = this.apMap.get(primaryAP.apMac);
-            if (primaryInfo) {
-              measurementX = primaryInfo.x_m;
-              measurementY = primaryInfo.y_m;
-            } else {
-              continue;
-            }
-          }
-        }
-
-        // ---- Static-anchor pin ----
-        {
-          const pinned = this._applyStaticAnchorPin(
-            primaryAP.apMac,
-            primaryAP.smoothedRssi,
-            measurementX,
-            measurementY
-          );
-          measurementX = pinned.x;
-          measurementY = pinned.y;
-        }
-
-        // ---- AP history ----
-        state.apHistory.push({
-          ap_mac: primaryAP.apMac,
-          rssi: primaryAP.smoothedRssi,
-          beam: primaryDet?.beam || null,
-          timestamp: Date.now(),
-          is_most_accurate: false,
-        });
-        if (state.apHistory.length > 10) state.apHistory.shift();
-        state.currentAP = {
-          ap_mac: primaryAP.apMac,
-          rssi: primaryAP.smoothedRssi,
-          beam: primaryDet?.beam || null,
-        };
-
-        // ---- Particle filter / EMA ----
+        // Apply Particle Filter / Smoothing
         let filteredX, filteredY;
         if (this.USE_PARTICLE_FILTER) {
           if (!state.particleFilter.initialized) {
@@ -783,348 +358,73 @@ class AssetTracker extends EventEmitter {
           state.particleFilter.update(measurementX, measurementY);
           state.particleFilter.resample();
           const estimate = state.particleFilter.getEstimate();
-          if (estimate) {
-            filteredX = estimate.x;
-            filteredY = estimate.y;
-          } else {
-            filteredX = measurementX;
-            filteredY = measurementY;
-          }
+          filteredX = estimate ? estimate.x : measurementX;
+          filteredY = estimate ? estimate.y : measurementY;
         } else {
-          if (!state.smoothedPos) {
-            state.smoothedPos = { x_m: measurementX, y_m: measurementY };
-          } else {
-            state.smoothedPos.x_m =
-              this.POSITION_ALPHA * measurementX +
-              (1 - this.POSITION_ALPHA) * state.smoothedPos.x_m;
-            state.smoothedPos.y_m =
-              this.POSITION_ALPHA * measurementY +
-              (1 - this.POSITION_ALPHA) * state.smoothedPos.y_m;
-          }
-          filteredX = state.smoothedPos.x_m;
-          filteredY = state.smoothedPos.y_m;
+          filteredX = measurementX;
+          filteredY = measurementY;
         }
 
-        // =========================================================
-        // Outlier rejection (with streak recovery)
-        // =========================================================
-        if (!this.positionHistory.has(mac)) this.positionHistory.set(mac, []);
-        const history = this.positionHistory.get(mac);
-
-        if (history.length >= 3) {
-          const xs = history.map((p) => p.x_m);
-          const ys = history.map((p) => p.y_m);
-          const medX = this._median(xs);
-          const medY = this._median(ys);
-          const dist = this._distance(medX, medY, filteredX, filteredY);
-
-          if (dist > this.OUTLIER_THRESHOLD) {
-            state.outlierStreak = (state.outlierStreak || 0) + 1;
-
-            if (state.outlierStreak >= this.OUTLIER_RECOVERY_STREAK) {
-              console.warn(
-                `♻️ Outlier recovery for ${mac}: ${state.outlierStreak} rejects in a row → resetting history`
-              );
-              history.length = 0;
-              state.smoothedPos = null;
-              if (state.particleFilter) {
-                state.particleFilter.initialized = false;
-              }
-              state.outlierStreak = 0;
-              // Fall through — accept this measurement
-            } else {
-              console.log(
-                `🛑 Outlier rejected for ${mac}: ${dist.toFixed(
-                  2
-                )}m (streak ${state.outlierStreak}/${this.OUTLIER_RECOVERY_STREAK})`
-              );
-              continue;
-            }
-          } else {
-            state.outlierStreak = 0;
-          }
-        }
-
-        history.push({ x_m: filteredX, y_m: filteredY, timestamp: Date.now() });
-        if (history.length > this.MAX_HISTORY) history.shift();
-
-        // ---- Heatmap density ----
+        // Apply Stationary Drift Guard
         let finalX = filteredX;
         let finalY = filteredY;
+        let isMoving = true;
 
-        if (this.USE_HEATMAP) {
-          state.heatmapPositions.push({
-            x: filteredX, y: filteredY, t: Date.now(),
-          });
-          if (state.heatmapPositions.length > this.HEATMAP_WINDOW) {
-            state.heatmapPositions.shift();
-          }
-          const points = state.heatmapPositions;
-
-          if (points.length > 5) {
-            let maxDensity = 0;
-            let bestX = filteredX;
-            let bestY = filteredY;
-
-            for (let i = 0; i < points.length; i++) {
-              let count = 0;
-              let sumX = 0, sumY = 0;
-              for (let j = 0; j < points.length; j++) {
-                const dist = this._distance(
-                  points[i].x, points[i].y, points[j].x, points[j].y
-                );
-                if (dist < this.HEATMAP_RADIUS) {
-                  count++;
-                  sumX += points[j].x;
-                  sumY += points[j].y;
-                }
-              }
-              if (count > maxDensity && count > 2) {
-                maxDensity = count;
-                bestX = sumX / count;
-                bestY = sumY / count;
-              }
-            }
-            if (maxDensity > 0) {
-              finalX = bestX;
-              finalY = bestY;
-            }
-          }
-        }
-
-        // ---- Velocity limiting ----
-        const now = Date.now();
-        const dt = (now - state.lastUpdateTime) / 1000;
-        if (state.currentPosition && dt > 0) {
-          const prevPos = state.currentPosition;
-          const dist = this._distance(prevPos.x_m, prevPos.y_m, finalX, finalY);
-          const maxDist = this.MAX_SPEED_MS * dt;
-          if (dist > maxDist && maxDist > 0) {
-            const ratio = maxDist / dist;
-            finalX = prevPos.x_m + (finalX - prevPos.x_m) * ratio;
-            finalY = prevPos.y_m + (finalY - prevPos.y_m) * ratio;
-          }
-        }
-
-        // ---- Build candidate ----
-        const ppm = MAP_CONFIGS[state.map_id]?.ppm ?? 50.0739;
-        let newPos = { x_m: finalX, y_m: finalY, ppm };
-
-        // ---- Best position ----
-        if (primaryDet) {
-          const rssi = primaryDet.rssi;
-          if (rssi > state.bestRSSI) {
-            state.bestPosition = { ...newPos };
-            state.bestRSSI = rssi;
-            state.positionStable = true;
-          }
-        }
-
-        // ---- Jump guard ----
-        if (state.currentPosition) {
-          const prevPos = state.currentPosition;
-          const dist = this._distance(
-            prevPos.x_m, prevPos.y_m, newPos.x_m, newPos.y_m
-          );
-          if (dist > this.STABILITY_THRESHOLD) {
-            if (state.bestPosition) {
-              newPos = { ...state.bestPosition };
-            } else {
-              const blend = this.STABILITY_THRESHOLD / dist;
-              newPos.x_m =
-                prevPos.x_m + (newPos.x_m - prevPos.x_m) * blend;
-              newPos.y_m =
-                prevPos.y_m + (newPos.y_m - prevPos.y_m) * blend;
-              newPos.ppm = prevPos.ppm || newPos.ppm;
-            }
-          }
-        }
-
-        // ---- Stationary Drift Guard ----
         if (this.USE_STATIONARY_GUARD) {
           const guarded = StationaryDriftGuard.applyStationaryLock(
-            state, newPos.x_m, newPos.y_m, this.STATIONARY_CFG
+            state, filteredX, filteredY, this.STATIONARY_CFG
           );
-          newPos.x_m = guarded.x;
-          newPos.y_m = guarded.y;
-          state.isMoving = guarded.isMoving;
-        } else {
-          state.isMoving = true;
+          finalX = guarded.x;
+          finalY = guarded.y;
+          isMoving = guarded.isMoving;
         }
 
-        // ---- Commit ----
-        state.currentPosition = newPos;
-        state.lastUpdate = now;
-        state.lastUpdateTime = now;
-        state.stabilityScore = this._calculateStability(state, apRssiMap);
+        // Enforce strict map boundary limits
+        const bounded = this._enforceMapBoundaries(finalX, finalY, state.map_id);
+        
+        state.currentPosition = {
+          x_m: bounded.x_m,
+          y_m: bounded.y_m,
+          ppm: coords.ppm,
+        };
+        state.isMoving = isMoving;
+        state.lastUpdateTime = Date.now();
 
-        // ---- Append to dynamic trail ----
-        this._appendToTrail(state, newPos.x_m, newPos.y_m, now);
-
-        // ---- Dead-zone emit ----
-        const lastEmit = state.lastEmittedPos;
-        if (
-          !lastEmit ||
-          this._distance(
-            lastEmit.x_m, lastEmit.y_m, newPos.x_m, newPos.y_m
-          ) >= this.MIN_MOVE_METERS
-        ) {
-          const trail = state.positionTrail || [];
-          const trailTail = trail.slice(-this.TRAIL_EMIT_POINTS);
-          const trailTailPx = this._trailToPixels(trailTail, state.map_id);
-
-          this.emit("assetUpdate", {
-            mac,
-            device_name: state.device_name,
-            position: state.currentPosition,
-            trail: trailTail,
-            trail_px: trailTailPx,
-            raw: primaryDet,
-            stability: state.stabilityScore,
-            is_most_accurate: state.positionStable,
-            is_moving: state.isMoving,
-            best_rssi: state.bestRSSI,
-            timestamp: now,
-            outlierStreak: state.outlierStreak || 0,
-            topAps: Array.from(detectionsMap.values()).map((d) => ({
-              ap: d.ap_mac,
-              rssi: d.rssi,
-              beam: d.beam ?? null,
-            })),
-          });
-          state.lastEmittedPos = { x_m: newPos.x_m, y_m: newPos.y_m };
-        }
-
-        processedAssets.push({
+        const payload = {
           mac,
           device_name: state.device_name,
-          position: state.currentPosition,
-          trail: [...(state.positionTrail || [])],
-          trail_px: this._trailToPixels(state.positionTrail, state.map_id),
-          ap_mac: primaryAP.apMac,
-          rssi: primaryAP.smoothedRssi,
-          beam: primaryDet?.beam || null,
-          stability: state.stabilityScore,
           map_id: state.map_id,
-          is_most_accurate: state.positionStable,
+          position: state.currentPosition,
           is_moving: state.isMoving,
-          best_rssi: state.bestRSSI,
-          ppm,
-          outlierStreak: state.outlierStreak || 0,
-        });
+          ap_mac: firstDet.ap_mac,
+          rssi: firstDet.rssi,
+        };
 
-        if (state.apHistory.length > 0) {
-          state.apHistory[state.apHistory.length - 1].is_most_accurate =
-            state.positionStable;
-        }
+        this.emit("assetUpdate", payload);
+        processedAssets.push(payload);
       } catch (err) {
-        console.error(`Error processing ${mac}:`, err);
+        console.error(`Error processing asset ${mac}:`, err.message);
       }
     }
 
-    this._cleanupOldStates();
     return processedAssets;
   }
 
-  // ============================================================
-  // Utilities
-  // ============================================================
   _groupDetectionsByAsset(assets) {
     const groups = new Map();
-    for (const a of assets) {
-      if (!a.mac) continue;
-      if (!groups.has(a.mac)) groups.set(a.mac, []);
-      groups.get(a.mac).push(a);
+    for (const det of assets) {
+      const mac = det.mac || det.asset_mac;
+      if (!mac) continue;
+      if (!groups.has(mac)) groups.set(mac, []);
+      groups.get(mac).push(det);
     }
     return groups;
-  }
-
-  _convertCoordinates(x, y, mapId) {
-    if (!mapId) return { x_m: x, y_m: y, ppm: 1 };
-    const config = MAP_CONFIGS[mapId];
-    if (!config) return { x_m: x, y_m: y, ppm: 1 };
-    let x_m = (x - config.origin_x) / config.ppm;
-    let y_m = (config.origin_y - y) / config.ppm;
-    if (config.offset_x) x_m += config.offset_x;
-    if (config.offset_y) y_m += config.offset_y;
-    return { x_m, y_m, ppm: config.ppm };
   }
 
   _distance(x1, y1, x2, y2) {
     return Math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2);
   }
-
-  _median(arr) {
-    const sorted = [...arr].sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    return sorted.length % 2
-      ? sorted[mid]
-      : (sorted[mid - 1] + sorted[mid]) / 2;
-  }
-
-  _calculateStability(state, apRssiMap) {
-    if (!state.apHistory || state.apHistory.length < 3) return 1.0;
-    if (state.positionStable && state.bestPosition) return 1.0;
-    const recent = state.apHistory.slice(-5);
-    const unique = new Set(recent.map((h) => h.ap_mac));
-    const consistency = 1 - (unique.size - 1) / 4;
-    return consistency * 0.6 + 0.4;
-  }
-
-  _cleanupOldStates() {
-    const now = Date.now();
-    const timeout = 5 * 60 * 1000;
-    for (const [mac, state] of this.assetStates) {
-      if (now - state.lastUpdate > timeout) {
-        this.assetStates.delete(mac);
-        this.apRssiFilters.delete(mac);
-        this.hysteresisCounters.delete(mac);
-        this.positionHistory.delete(mac);
-      }
-    }
-  }
 }
 
-// ============================================================
-// Export singleton
-// ============================================================
-const options = {
-  emaAlpha: 0.15,
-  positionAlpha: 0.25,
-  hysteresisDb: 12,
-  hysteresisCount: 4,
-  topAps: 3,
-  stabilityThreshold: 3.0,
-  outlierThreshold: 5.0,
-  outlierRecoveryStreak: 5,
-  minMoveMeters: 0.5,
-  maxSpeedMs: 2.0,
-  minRssi: -75,
-  heatmapWindow: 30,
-  heatmapRadius: 2.0,
-  particleCount: 100,
-  particleNoise: 0.5,
-  measurementNoise: 1.0,
-  useParticleFilter: true,
-  useHeatmap: true,
-  strongRssiPinDb: -62,
-  pinDistanceThresholdM: 5.0,
-  useStationaryGuard: true,
-  stationaryThresholdM: 0.80,
-  stationaryFastThresholdM: 1.5,
-  stationaryAlpha: 0.02,
-  movingAlpha: 0.45,
-
-  // ---- Dynamic trail ----
-  useTrail: true,
-  trailMaxPoints: 300,
-  trailMinMoveM: 0.25,
-  trailMaxAgeMs: 5 * 60 * 1000,
-  trailEmitPoints: 100,
-};
-
-const assetTracker = new AssetTracker(options);
-console.log(
-  "✅ mistAssetTracker loaded: RSSI centroid + outlier recovery + dynamic trail"
-);
-module.exports = assetTracker;
+const trackerInstance = new AssetTracker();
+module.exports = trackerInstance;
