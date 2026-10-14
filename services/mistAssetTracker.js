@@ -14,10 +14,6 @@
 //   - Dynamic position trail (breadcrumb, replaces wayfinding-path snapping)
 //
 // Exports a singleton EventEmitter.
-//
-// Request flow:
-//   Client → getAssetsCached() → Redis fresh? → HIT return
-//                              → MISS/STALE → Mist → process → Redis save → return
 
 const axios = require("axios");
 const EventEmitter = require("events");
@@ -37,13 +33,11 @@ if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
 const REDIS_URL = process.env.REDIS_URL || "redis://localhost:6379";
 const ASSET_TTL_SEC = parseInt(process.env.ASSET_TTL_SEC || "300", 10);
 
-// Freshness window — data younger than this is served from Redis as-is
 const FRESH_WINDOW_MS = parseInt(
   process.env.ASSET_FRESH_WINDOW_MS || "1500",
   10,
 );
 
-// Single-flight lock TTL (concurrent requests share one Mist fetch)
 const FETCH_LOCK_TTL_MS = parseInt(
   process.env.ASSET_FETCH_LOCK_MS || "10000",
   10,
@@ -85,6 +79,66 @@ const MAP_CONFIGS = {
     offset_x: 0,
     offset_y: 0,
   },
+  "cb424deb-7d15-4c86-93fb-688116b713ee": {
+    name: "MB3-F04",
+    width: 6400,
+    height: 5120,
+    width_m: 100,
+    height_m: 100,
+    origin_x: 0,
+    origin_y: 0,
+    ppm: 50,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  "fb2f9216-02a7-423d-ab04-856fc2d1edb4": {
+    name: "MB3-F02",
+    width: 6400,
+    height: 5120,
+    width_m: 100,
+    height_m: 100,
+    origin_x: 0,
+    origin_y: 0,
+    ppm: 50,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  "1cd59ea1-3478-4bd0-b4b9-5e78a002331e": {
+    name: "MB3-F03",
+    width: 6400,
+    height: 5120,
+    width_m: 100,
+    height_m: 100,
+    origin_x: 0,
+    origin_y: 0,
+    ppm: 50,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  "efeca217-1f71-49cd-87b5-7023b40494f2": {
+    name: "MB3-F05",
+    width: 6400,
+    height: 5120,
+    width_m: 100,
+    height_m: 100,
+    origin_x: 0,
+    origin_y: 0,
+    ppm: 50,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  "7e5341c9-f9ce-4aad-ae6a-8234c3a3866e": {
+    name: "MB3-M1",
+    width: 6400,
+    height: 5120,
+    width_m: 100,
+    height_m: 100,
+    origin_x: 0,
+    origin_y: 0,
+    ppm: 50,
+    offset_x: 0,
+    offset_y: 0,
+  },
   default: {
     name: "default",
     width: 6400,
@@ -102,22 +156,14 @@ const MAP_CONFIGS = {
 // ============================================================
 // AP CORRECTIONS
 //
-// ⚠️ FIX #1 — MAC was "c878678aa2ab" but the real primary AP that
-// the tag is anchored to is "c878678aa0a8". With the wrong MAC,
-// the static-anchor pin NEVER fires and the raw AoA estimate is
-// used directly → tag jumps around.
-//
-// If you have more APs that need rotation / RSSI offsets, add
-// them here.
+// ⚠️ EMPTY ON PURPOSE.
+// The previous entry (c878678aa0a8 / c878678aa2ab) was pinning the tag
+// against the WRONG AP. Fix #1 (below) makes AP positions come from
+// MAP_CONFIGS so we no longer need an anchor correction. If you later
+// find a specific AP that needs a rotation/rssi fix, add it here — but
+// only after verifying the tag's real zone.
 // ============================================================
-const AP_CORRECTIONS = {
-  c878678aa0a8: {
-    rotationOffsetDeg: 180,
-    rssiOffsetDb: +4,
-    isStaticZoneAnchor: true,
-    zoneBounds: { minX: 100, maxX: 115, minY: 25, maxY: 35 },
-  },
-};
+const AP_CORRECTIONS = {};
 
 // ============================================================
 // Particle Filter
@@ -204,12 +250,6 @@ class ParticleFilter {
 
 // ============================================================
 // Stationary Drift Guard
-//
-// ⚠️ FIX #2 — thresholds raised:
-//   threshold         0.80 → 2.50 m   (hard lock radius)
-//   fastThreshold     1.50 → 4.00 m   (when to trust a jump)
-//   stationaryAlpha   0.02 → 0.005    (near-frozen when slow)
-//   movingAlpha       0.45 → 0.30     (softer blend when moving)
 // ============================================================
 class StationaryDriftGuard {
   static applyStationaryLock(state, candidateX, candidateY, cfg = {}) {
@@ -242,18 +282,17 @@ class StationaryDriftGuard {
 }
 
 // ============================================================
-// REDIS CLIENT (middle-layer storage)
+// REDIS CLIENT
 // ============================================================
 const redis = createClient({ url: REDIS_URL });
 redis.on("error", (e) => console.error("❌ Redis error:", e.message));
 
-// Key schema
 const K = {
-  asset: (mac) => `mist:asset:${mac}`, // HASH  — latest snapshot
-  trail: (mac) => `mist:asset:${mac}:trail`, // LIST  — breadcrumb points
-  index: "mist:assets:index", // SET   — all known macs
-  meta: "mist:assets:meta", // HASH  — last_fetch_at, last_error
-  lock: "mist:assets:fetch_lock", // STRING — single-flight lock
+  asset: (mac) => `mist:asset:${mac}`,
+  trail: (mac) => `mist:asset:${mac}:trail`,
+  index: "mist:assets:index",
+  meta: "mist:assets:meta",
+  lock: "mist:assets:fetch_lock",
 };
 
 // ============================================================
@@ -271,19 +310,14 @@ class AssetTracker extends EventEmitter {
     // --- Tuning ---
     this.EMA_ALPHA = options.emaAlpha ?? 0.15;
     this.POSITION_ALPHA = options.positionAlpha ?? 0.15;
-    this.HYSTERESIS_DB = options.hysteresisDb ?? 12;
-    this.HYSTERESIS_COUNT = options.hysteresisCount ?? 4;
+    this.HYSTERESIS_DB = options.hysteresisDb ?? 6;
+    this.HYSTERESIS_COUNT = options.hysteresisCount ?? 3;
     this.TOP_APS = options.topAps ?? 3;
     this.STABILITY_THRESHOLD = options.stabilityThreshold ?? 3.0;
     this.OUTLIER_THRESHOLD = options.outlierThreshold ?? 5.0;
 
-    // ⚠️ FIX #5 — dead zone raised 0.5 → 1.5 m
     this.MIN_MOVE_METERS = options.minMoveMeters ?? 1.5;
-
-    // ⚠️ FIX #5 — max speed lowered 2.0 → 1.5 m/s
     this.MAX_SPEED_MS = options.maxSpeedMs ?? 1.5;
-
-    // ⚠️ FIX #4 — RSSI floor raised -75 → -68 dBm
     this.MIN_RSSI = options.minRssi ?? -68;
 
     this.MAX_HISTORY = 7;
@@ -296,12 +330,9 @@ class AssetTracker extends EventEmitter {
     this.USE_PARTICLE_FILTER = options.useParticleFilter ?? true;
     this.USE_HEATMAP = options.useHeatmap ?? true;
 
-    // --- AP correction / static-anchor pinning ---
-    // ⚠️ FIX #1 — pin now only fires above -55 dBm (was -62)
     this.STRONG_RSSI_PIN_DB = options.strongRssiPinDb ?? -55;
     this.PIN_DISTANCE_THRESHOLD_M = options.pinDistanceThresholdM ?? 8.0;
 
-    // --- Stationary Drift Guard ---
     this.USE_STATIONARY_GUARD = options.useStationaryGuard ?? true;
     this.STATIONARY_CFG = {
       threshold: options.stationaryThresholdM ?? 2.5,
@@ -311,19 +342,16 @@ class AssetTracker extends EventEmitter {
       ...(options.stationaryCfg || {}),
     };
 
-    // --- Dynamic path (breadcrumb trail) ---
     this.USE_TRAIL = options.useTrail ?? true;
     this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;
     this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.5;
     this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
     this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
 
-    // --- Best-RSSI decay (FIX #3) ---
     this.BEST_RSSI_DECAY_DB_PER_SEC = options.bestRssiDecayDbPerSec ?? 0.5;
     this.BEST_RSSI_MIN_IMPROVEMENT = options.bestRssiMinImprovement ?? 2.0;
     this.BEST_RSSI_MAX_DRIFT_M = options.bestRssiMaxDriftM ?? 3.0;
 
-    // --- Minimum AP count gate (FIX #4) ---
     this.MIN_AP_COUNT = options.minApCount ?? 3;
 
     // --- Backoff ---
@@ -343,7 +371,13 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // ap_list.json loading + AP_CORRECTIONS merge
+  // ap_list.json loading
+  //
+  // ⚠️ FIX #1 — NEVER trust x_m / y_m from the JSON.
+  // Derive them from the pixel x/y using OUR MAP_CONFIGS so every
+  // AP lives in the same coordinate frame. This removes the ~6 m
+  // eastward offset that was making the tag jump when the primary
+  // AP flipped.
   // ============================================================
   _loadStaticAPs() {
     try {
@@ -351,32 +385,63 @@ class AssetTracker extends EventEmitter {
       const raw = fs.readFileSync(filePath, "utf8");
       const apList = JSON.parse(raw);
 
-      if (Array.isArray(apList) && apList.length > 0) {
-        for (const ap of apList) {
-          if (ap.mac && ap.x_m !== undefined && ap.y_m !== undefined) {
-            const correction = AP_CORRECTIONS[ap.mac] || {};
-            this.apMap.set(ap.mac, {
-              x_m: ap.x_m,
-              y_m: ap.y_m,
-              name: ap.name || ap.mac,
-              orientation:
-                (ap.orientation || 0) + (correction.rotationOffsetDeg || 0),
-              rssiOffset: correction.rssiOffsetDb || 0,
-              isStaticAnchor: correction.isStaticZoneAnchor || false,
-              zoneBounds: correction.zoneBounds || null,
-              rotationOffsetDeg: correction.rotationOffsetDeg || 0,
-            });
-          }
-        }
-        this.apListFetched = true;
-        console.log(
-          `✅ Loaded ${this.apMap.size} APs from ap_list.json (with corrections)`,
-        );
-      } else {
-        console.warn(
-          "⚠️ ap_list.json is empty – AP-centroid will fallback to Mist coords.",
-        );
+      if (!Array.isArray(apList) || apList.length === 0) {
+        console.warn("⚠️ ap_list.json is empty.");
+        return;
       }
+
+      let loaded = 0;
+      let skippedNoMap = 0;
+      let skippedNoCoords = 0;
+
+      for (const ap of apList) {
+        if (!ap.mac) continue;
+
+        const cfg = MAP_CONFIGS[ap.map_id];
+        if (!cfg) {
+          skippedNoMap++;
+          continue;
+        }
+
+        let x_m, y_m;
+        const hasPixels =
+          Number.isFinite(ap.x) &&
+          Number.isFinite(ap.y) &&
+          ap.x !== 0 &&
+          ap.y !== 0;
+
+        if (hasPixels) {
+          x_m = (ap.x - cfg.origin_x) / cfg.ppm;
+          y_m = (cfg.origin_y - ap.y) / cfg.ppm;
+        } else if (Number.isFinite(ap.x_m) && Number.isFinite(ap.y_m)) {
+          x_m = ap.x_m;
+          y_m = ap.y_m;
+        } else {
+          skippedNoCoords++;
+          continue;
+        }
+
+        const correction = AP_CORRECTIONS[ap.mac] || {};
+        this.apMap.set(ap.mac, {
+          x_m,
+          y_m,
+          name: ap.name || ap.mac,
+          orientation:
+            (ap.orientation || 0) + (correction.rotationOffsetDeg || 0),
+          rssiOffset: correction.rssiOffsetDb || 0,
+          isStaticAnchor: correction.isStaticZoneAnchor || false,
+          zoneBounds: correction.zoneBounds || null,
+          rotationOffsetDeg: correction.rotationOffsetDeg || 0,
+          map_id: ap.map_id,
+        });
+        loaded++;
+      }
+
+      this.apListFetched = true;
+      console.log(
+        `✅ Loaded ${loaded} APs from ap_list.json ` +
+          `(skipped ${skippedNoMap} unknown-map, ${skippedNoCoords} no-coords)`,
+      );
     } catch (err) {
       console.warn(
         "⚠️ Could not load ap_list.json – AP-centroid will fallback.",
@@ -400,9 +465,8 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // PUBLIC API — callers use THESE (never call Mist directly)
+  // PUBLIC API
   // ============================================================
-
   async getAssetsCached(opts = {}) {
     const { force = false, allowStale = true } = opts;
 
@@ -642,9 +706,6 @@ class AssetTracker extends EventEmitter {
     };
   }
 
-  // ============================================================
-  // Redis write helper (called ONLY after a Mist fetch)
-  // ============================================================
   async _writeBatchToRedis(assets) {
     if (!this._redisReady || !assets || assets.length === 0) return;
     const now = Date.now();
@@ -702,7 +763,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Public getters (legacy — Redis-backed)
+  // Legacy getters
   // ============================================================
   getCachedAssets() {
     return this.cachedProcessedAssets || [];
@@ -769,7 +830,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Preprocess a single AP detection (AoA correction only)
+  // Preprocess a detection (AoA correction only)
   // ============================================================
   _preprocessDetection(apMac, rawX, rawY, rawRssi) {
     const ap = this.apMap.get(apMac);
@@ -790,7 +851,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Static-anchor pin (reception AP only)
+  // Static-anchor pin (only fires if you add entries to AP_CORRECTIONS)
   // ============================================================
   _applyStaticAnchorPin(primaryApMac, correctedRssi, x, y) {
     const ap = this.apMap.get(primaryApMac);
@@ -841,7 +902,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Main pipeline for a batch of Mist detections
+  // Main pipeline
   // ============================================================
   _processAssetData(assets) {
     if (!Array.isArray(assets)) {
@@ -896,6 +957,33 @@ class AssetTracker extends EventEmitter {
           }
           this.assetStates.set(mac, state);
         }
+
+        // ⚠️ FIX #2 — Map change detection. If Mist reports the tag on a
+        // different floor than last time, reset all smooth state (particle
+        // filter, trail, best position) so nothing drags the tag back.
+        if (state.map_id && state.map_id !== firstDet.map_id) {
+          console.log(
+            `🔄 Asset ${mac} moved map: ${MAP_CONFIGS[state.map_id]?.name || state.map_id} → ` +
+              `${MAP_CONFIGS[firstDet.map_id]?.name || firstDet.map_id}`,
+          );
+          state.currentPosition = null;
+          state.bestPosition = null;
+          state.bestRSSI = -Infinity;
+          state.positionTrail = [];
+          state.heatmapPositions = [];
+          state.lastEmittedPos = null;
+          state.positionStable = false;
+          state.smoothedPos = null;
+          state.map_id = firstDet.map_id;
+          if (this.USE_PARTICLE_FILTER) {
+            state.particleFilter = new ParticleFilter(
+              this.PARTICLE_COUNT,
+              this.PARTICLE_NOISE,
+              this.MEASUREMENT_NOISE,
+            );
+          }
+        }
+
         state.lastRawRssi = firstDet.rssi;
 
         // ---- Per-AP EMA of RSSI ----
@@ -925,7 +1013,7 @@ class AssetTracker extends EventEmitter {
 
         if (sortedAPs.length === 0) continue;
 
-        // ---- Hysteresis on primary AP ----
+        // ---- Hysteresis ----
         const bestAP = sortedAPs[0];
         const currentPrimary =
           this.hysteresisCounters.get(mac)?.currentAP || null;
@@ -1055,9 +1143,7 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ⚠️ FIX #4 — Require ≥ MIN_AP_COUNT anchors, otherwise do NOT move.
-        // This kills the vast majority of jumps when only 1–2 APs hear the
-        // tag and AoA noise dominates.
+        // ⚠️ Require ≥ MIN_AP_COUNT anchors, else keep last position
         if (apPositions.length < this.MIN_AP_COUNT) {
           state.apHistory.push({
             ap_mac: primaryAP.apMac,
@@ -1262,17 +1348,15 @@ class AssetTracker extends EventEmitter {
         const ppm = MAP_CONFIGS[state.map_id]?.ppm ?? 50.0739;
         let newPos = { x_m: finalX, y_m: finalY, ppm };
 
-        // ---- Best position (⚠️ FIX #3 — decay + spatial gate) ----
+        // ---- Best position (with decay + spatial gate) ----
         if (primaryDet) {
           const rssi = primaryDet.rssi;
 
-          // Slow decay so a one-time RSSI peak doesn't latch forever
           if (state.bestRSSI !== -Infinity && state.lastUpdateTime) {
             const elapsed = (Date.now() - state.lastUpdateTime) / 1000;
             state.bestRSSI -= this.BEST_RSSI_DECAY_DB_PER_SEC * elapsed;
           }
 
-          // Only promote to "best" if meaningfully better AND spatially close
           if (rssi > state.bestRSSI + this.BEST_RSSI_MIN_IMPROVEMENT) {
             const nearCurrent =
               !state.currentPosition ||
@@ -1312,7 +1396,7 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ---- Stationary Drift Guard (⚠️ FIX #2 — tightened) ----
+        // ---- Stationary Drift Guard ----
         if (this.USE_STATIONARY_GUARD) {
           const guarded = StationaryDriftGuard.applyStationaryLock(
             state,
@@ -1333,10 +1417,10 @@ class AssetTracker extends EventEmitter {
         state.lastUpdateTime = now;
         state.stabilityScore = this._calculateStability(state, apRssiMap);
 
-        // ---- Append to dynamic trail ----
+        // ---- Append to trail ----
         this._appendToTrail(state, newPos.x_m, newPos.y_m, now);
 
-        // ---- Emit (dead-zone gated, ⚠️ FIX #5 — 1.5 m dead zone) ----
+        // ---- Emit (dead-zone gated) ----
         const lastEmit = state.lastEmittedPos;
         if (
           !lastEmit ||
@@ -1353,6 +1437,10 @@ class AssetTracker extends EventEmitter {
             position: state.currentPosition,
             trail: trailTail,
             trail_px: trailTailPx,
+            primary_ap_name:
+              this.apMap.get(primaryAP.apMac)?.name || primaryAP.apMac,
+            primary_ap_mac: primaryAP.apMac,
+            ap_count: apPositions.length,
             raw: primaryDet,
             stability: state.stabilityScore,
             is_most_accurate: state.positionStable,
@@ -1362,6 +1450,7 @@ class AssetTracker extends EventEmitter {
             topAps: Array.from(detectionsMap.values()).map((d) => ({
               ap: d.ap_mac,
               rssi: d.rssi,
+              beam: d.beam,
             })),
           });
           state.lastEmittedPos = { x_m: newPos.x_m, y_m: newPos.y_m };
@@ -1461,49 +1550,45 @@ class AssetTracker extends EventEmitter {
 // ============================================================
 const options = {
   emaAlpha: 0.15,
-  positionAlpha: 0.15, // was 0.25  → smoother EMA fallback
-  hysteresisDb: 12,
-  hysteresisCount: 4,
+  positionAlpha: 0.15,
+  hysteresisDb: 6,
+  hysteresisCount: 3,
   topAps: 3,
   stabilityThreshold: 3.0,
   outlierThreshold: 5.0,
-  minMoveMeters: 1.5, // was 0.5   → bigger dead zone for emit
-  maxSpeedMs: 1.5, // was 2.0   → slower max speed
-  minRssi: -68, // was -75   → stricter RSSI floor
+  minMoveMeters: 1.5,
+  maxSpeedMs: 1.5,
+  minRssi: -68,
   heatmapWindow: 30,
   heatmapRadius: 2.0,
   particleCount: 100,
-  particleNoise: 0.3, // was 0.5   → less process noise
-  measurementNoise: 1.5, // was 1.0   → trust measurement less
+  particleNoise: 0.3,
+  measurementNoise: 1.5,
   useParticleFilter: true,
   useHeatmap: true,
-  strongRssiPinDb: -55, // was -62   → pin only on really strong
-  pinDistanceThresholdM: 8.0, // was 5.0
+  strongRssiPinDb: -55,
+  pinDistanceThresholdM: 8.0,
   useStationaryGuard: true,
-  stationaryThresholdM: 2.5, // was 0.80  ← BIGGEST IMPACT
-  stationaryFastThresholdM: 4.0, // was 1.5
-  stationaryAlpha: 0.005, // was 0.02
-  movingAlpha: 0.3, // was 0.45
+  stationaryThresholdM: 2.5,
+  stationaryFastThresholdM: 4.0,
+  stationaryAlpha: 0.005,
+  movingAlpha: 0.3,
 
-  // ---- Best-RSSI decay (FIX #3) ----
   bestRssiDecayDbPerSec: 0.5,
   bestRssiMinImprovement: 2.0,
   bestRssiMaxDriftM: 3.0,
 
-  // ---- Minimum AP count gate (FIX #4) ----
   minApCount: 3,
 
-  // ---- Dynamic trail ----
   useTrail: true,
   trailMaxPoints: 300,
-  trailMinMoveM: 0.5, // was 0.25  → less trail jitter
+  trailMinMoveM: 0.5,
   trailMaxAgeMs: 5 * 60 * 1000,
   trailEmitPoints: 100,
 };
 
 const assetTracker = new AssetTracker(options);
 
-// Boot — Redis connect only. NO poller. NO setInterval.
 (async () => {
   try {
     await assetTracker.initRedis();
