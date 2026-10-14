@@ -12,6 +12,7 @@
 //   - Velocity limiting + jump guard
 //   - Stationary Drift Guard (dead-zone lock + adaptive alpha)
 //   - Dynamic position trail (breadcrumb, replaces wayfinding-path snapping)
+//   - Trail hygiene: velocity reject, return-to-base trim, spread cap
 //
 // Exports a singleton EventEmitter.
 
@@ -155,13 +156,8 @@ const MAP_CONFIGS = {
 
 // ============================================================
 // AP CORRECTIONS
-//
-// ⚠️ EMPTY ON PURPOSE.
-// The previous entry (c878678aa0a8 / c878678aa2ab) was pinning the tag
-// against the WRONG AP. Fix #1 (below) makes AP positions come from
-// MAP_CONFIGS so we no longer need an anchor correction. If you later
-// find a specific AP that needs a rotation/rssi fix, add it here — but
-// only after verifying the tag's real zone.
+// (empty on purpose — the previous entry pinned the tag against
+// the wrong AP; positions now come from MAP_CONFIGS)
 // ============================================================
 const AP_CORRECTIONS = {};
 
@@ -342,11 +338,25 @@ class AssetTracker extends EventEmitter {
       ...(options.stationaryCfg || {}),
     };
 
+    // --- Trail tuning ---
     this.USE_TRAIL = options.useTrail ?? true;
     this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;
     this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.5;
     this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
     this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
+
+    // --- Trail hygiene (Fix A / B / C) ---
+    // Max allowed speed between two consecutive trail points
+    this.TRAIL_MAX_SPEED_MS =
+      options.trailMaxSpeedMs ?? this.MAX_SPEED_MS * 1.5;
+    // When tag returns within this radius of an older point, drop the detour
+    this.TRAIL_RETURN_MATCH_M = options.trailReturnMatchM ?? 3.0;
+    // Only consider points older than this (ms) for return-match
+    this.TRAIL_RETURN_MIN_AGE_MS = options.trailReturnMinAgeMs ?? 30_000;
+    // Purge trail points further than this from the recent cluster
+    this.TRAIL_MAX_SPREAD_M = options.trailMaxSpreadM ?? 15.0;
+    // Size of the "recent cluster" used for the spread check
+    this.TRAIL_CLUSTER_SIZE = options.trailClusterSize ?? 5;
 
     this.BEST_RSSI_DECAY_DB_PER_SEC = options.bestRssiDecayDbPerSec ?? 0.5;
     this.BEST_RSSI_MIN_IMPROVEMENT = options.bestRssiMinImprovement ?? 2.0;
@@ -371,13 +381,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // ap_list.json loading
-  //
-  // ⚠️ FIX #1 — NEVER trust x_m / y_m from the JSON.
-  // Derive them from the pixel x/y using OUR MAP_CONFIGS so every
-  // AP lives in the same coordinate frame. This removes the ~6 m
-  // eastward offset that was making the tag jump when the primary
-  // AP flipped.
+  // ap_list.json loading (derive x_m/y_m from pixels)
   // ============================================================
   _loadStaticAPs() {
     try {
@@ -851,7 +855,7 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Static-anchor pin (only fires if you add entries to AP_CORRECTIONS)
+  // Static-anchor pin
   // ============================================================
   _applyStaticAnchorPin(primaryApMac, correctedRssi, x, y) {
     const ap = this.apMap.get(primaryApMac);
@@ -866,7 +870,11 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
-  // Trail helpers
+  // Trail — Fix B: velocity check on append
+  //
+  // Rejects any point that would require the tag to travel faster than
+  // TRAIL_MAX_SPEED_MS. This is what stops a 40 m AoA artefact from
+  // entering the trail.
   // ============================================================
   _appendToTrail(state, x_m, y_m, now) {
     if (!this.USE_TRAIL) return;
@@ -875,19 +883,87 @@ class AssetTracker extends EventEmitter {
     const trail = state.positionTrail;
     const last = trail[trail.length - 1];
 
-    if (
-      last &&
-      this._distance(last.x_m, last.y_m, x_m, y_m) < this.TRAIL_MIN_MOVE_M
-    ) {
-      // Skip — jitter
-    } else {
-      trail.push({ x_m, y_m, t: now });
+    if (last) {
+      const moved = this._distance(last.x_m, last.y_m, x_m, y_m);
+      const dtSec = Math.max((now - (last.t || now)) / 1000, 0.001);
+      const speed = moved / dtSec;
+
+      // Fix B — physically impossible move → don't record it
+      if (moved > this.TRAIL_MIN_MOVE_M && speed > this.TRAIL_MAX_SPEED_MS) {
+        return;
+      }
+
+      // Jitter → don't record it
+      if (moved < this.TRAIL_MIN_MOVE_M) {
+        return;
+      }
     }
+
+    trail.push({ x_m, y_m, t: now });
 
     while (trail.length > this.TRAIL_MAX_POINTS) trail.shift();
 
     const cutoff = now - this.TRAIL_MAX_AGE_MS;
     while (trail.length > 0 && trail[0].t < cutoff) trail.shift();
+  }
+
+  // ============================================================
+  // Trail — Fix A: return-to-base trim
+  //
+  // If the tag comes back within TRAIL_RETURN_MATCH_M metres of an
+  // older trail point (older than TRAIL_RETURN_MIN_AGE_MS), drop
+  // everything between that older point and now. This removes the
+  // "detour" segment that a bad AoA report left in the trail.
+  // ============================================================
+  _trimTrailOnReturn(state, x_m, y_m) {
+    const trail = state.positionTrail;
+    if (!trail || trail.length < 4) return;
+
+    const now = Date.now();
+    const minAge = this.TRAIL_RETURN_MIN_AGE_MS;
+    const matchM = this.TRAIL_RETURN_MATCH_M;
+
+    // Look at older points, oldest-first
+    for (let i = 0; i < trail.length - 2; i++) {
+      const p = trail[i];
+      const age = now - (p.t || 0);
+      if (age < minAge) continue;
+
+      const d = this._distance(p.x_m, p.y_m, x_m, y_m);
+      if (d < matchM) {
+        // Tag returned to an older spot — cut out everything after it
+        const kept = trail.slice(0, i + 1);
+        kept.push({ x_m, y_m, t: now });
+        state.positionTrail = kept;
+        return;
+      }
+    }
+  }
+
+  // ============================================================
+  // Trail — Fix C: spread cap
+  //
+  // Compute the centroid of the most recent TRAIL_CLUSTER_SIZE points.
+  // Any older point further than TRAIL_MAX_SPREAD_M from that centroid
+  // is considered an artefact and removed.
+  // ============================================================
+  _trimTrailBySpread(state) {
+    const trail = state.positionTrail;
+    if (!trail || trail.length < 3) return;
+
+    const n = Math.min(this.TRAIL_CLUSTER_SIZE, trail.length);
+    const recent = trail.slice(-n);
+    const cx = recent.reduce((s, p) => s + p.x_m, 0) / n;
+    const cy = recent.reduce((s, p) => s + p.y_m, 0) / n;
+
+    const cutoff = trail.length - n;
+    const kept = trail.filter(
+      (p, idx) =>
+        idx >= cutoff ||
+        this._distance(p.x_m, p.y_m, cx, cy) <= this.TRAIL_MAX_SPREAD_M,
+    );
+
+    state.positionTrail = kept;
   }
 
   _trailToPixels(trail, mapId) {
@@ -958,12 +1034,11 @@ class AssetTracker extends EventEmitter {
           this.assetStates.set(mac, state);
         }
 
-        // ⚠️ FIX #2 — Map change detection. If Mist reports the tag on a
-        // different floor than last time, reset all smooth state (particle
-        // filter, trail, best position) so nothing drags the tag back.
+        // ---- Map change detection ----
         if (state.map_id && state.map_id !== firstDet.map_id) {
           console.log(
-            `🔄 Asset ${mac} moved map: ${MAP_CONFIGS[state.map_id]?.name || state.map_id} → ` +
+            `🔄 Asset ${mac} moved map: ` +
+              `${MAP_CONFIGS[state.map_id]?.name || state.map_id} → ` +
               `${MAP_CONFIGS[firstDet.map_id]?.name || firstDet.map_id}`,
           );
           state.currentPosition = null;
@@ -1143,7 +1218,7 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ⚠️ Require ≥ MIN_AP_COUNT anchors, else keep last position
+        // Require ≥ MIN_AP_COUNT anchors, else keep last position
         if (apPositions.length < this.MIN_AP_COUNT) {
           state.apHistory.push({
             ap_mac: primaryAP.apMac,
@@ -1348,7 +1423,7 @@ class AssetTracker extends EventEmitter {
         const ppm = MAP_CONFIGS[state.map_id]?.ppm ?? 50.0739;
         let newPos = { x_m: finalX, y_m: finalY, ppm };
 
-        // ---- Best position (with decay + spatial gate) ----
+        // ---- Best position (decay + spatial gate) ----
         if (primaryDet) {
           const rssi = primaryDet.rssi;
 
@@ -1417,7 +1492,12 @@ class AssetTracker extends EventEmitter {
         state.lastUpdateTime = now;
         state.stabilityScore = this._calculateStability(state, apRssiMap);
 
-        // ---- Append to trail ----
+        // ---- Trail hygiene (Fix A + Fix C applied BEFORE Fix B) ----
+        // 1. If we've returned to an older point, drop the detour.
+        this._trimTrailOnReturn(state, newPos.x_m, newPos.y_m);
+        // 2. Drop any point that's too far from the recent cluster.
+        this._trimTrailBySpread(state);
+        // 3. Append the new point (with velocity check inside).
         this._appendToTrail(state, newPos.x_m, newPos.y_m, now);
 
         // ---- Emit (dead-zone gated) ----
@@ -1580,11 +1660,21 @@ const options = {
 
   minApCount: 3,
 
+  // ---- Dynamic trail + hygiene ----
   useTrail: true,
   trailMaxPoints: 300,
   trailMinMoveM: 0.5,
   trailMaxAgeMs: 5 * 60 * 1000,
   trailEmitPoints: 100,
+
+  // Fix B
+  trailMaxSpeedMs: 2.25, // = maxSpeedMs * 1.5
+  // Fix A
+  trailReturnMatchM: 3.0,
+  trailReturnMinAgeMs: 30_000,
+  // Fix C
+  trailMaxSpreadM: 15.0,
+  trailClusterSize: 5,
 };
 
 const assetTracker = new AssetTracker(options);
