@@ -63,60 +63,32 @@ app.use("/api/Cabinet", CabinetRoutes);
 app.use("/api/cabinets", CabinetRoutes);
 
 /* =======================
-   🔥 Asset Tracking Routes (ENHANCED)
+   🔥 Asset Tracking Routes
+   (Redis-cached, on-demand — no polling)
 ======================= */
 
-// Helper function to get map config (same as in mistAssetTracker.js)
-function getMapConfig(mapId) {
-  const MAP_CONFIGS = {
-    "30141417-44ea-4982-993c-6225c9f08315": {
-      name: "MB3-F00",
-      width: 6400,
-      height: 5120,
-      width_m: 127.81105527098556,
-      height_m: 102.24884421678846,
-      origin_x: 306.45106507695385,
-      origin_y: 3856.483584010582,
-      ppm: 50.07391564392213,
-    },
-    "cfa55e13-794f-4081-b1b7-e35f1ea67325": {
-      name: "MB3-F01",
-      width: 6400,
-      height: 5120,
-      width_m: 111.74050632911398,
-      height_m: 89.39240506329119,
-      origin_x: 6.786923314266026,
-      origin_y: 4134.933029216576,
-      ppm: 57.275559331634064,
-    },
-  };
-  return MAP_CONFIGS[mapId] || null;
-}
-
-// GET all tracked assets with full diagnostics (pixel + meter coords, AP info)
-app.get("/api/assets", (req, res) => {
+// GET all tracked assets with full diagnostics
+// Query params:
+//   ?force=1   → skip Redis freshness window, hit Mist
+app.get("/api/assets", async (req, res) => {
   try {
-    const states = assetTracker.getAssetStates();
+    const force = req.query.force === "1";
 
+    const assets = await assetTracker.getAssetsCached({
+      force,
+      allowStale: true,
+    });
+
+    // Build MAC-keyed map (matches old response shape used by frontend)
     const enhancedAssets = {};
-    for (const [mac, state] of Object.entries(states)) {
-      const mapConfig = state.map_id ? getMapConfig(state.map_id) : null;
-
-      let position_px = null;
-      if (state.position && mapConfig) {
-        position_px = {
-          x: state.position.x_m * mapConfig.ppm + mapConfig.origin_x,
-          y: mapConfig.origin_y - state.position.y_m * mapConfig.ppm,
-        };
-      }
-
-      enhancedAssets[mac] = {
-        ...state,
-        position_px: position_px,
-        ap_mac: state.ap_mac || null,
-        beam: state.beam || null,
-        rssi: state.rssi || state.best_rssi || null,
-        raw_rssi: state.raw_rssi || null,
+    for (const a of assets) {
+      enhancedAssets[a.mac] = {
+        ...a,
+        position_px: a.position_px || null,
+        ap_mac: a.ap_mac || null,
+        beam: a.beam ?? null,
+        rssi: a.rssi ?? a.best_rssi ?? null,
+        raw_rssi: a.raw_rssi ?? null,
       };
     }
 
@@ -133,37 +105,29 @@ app.get("/api/assets", (req, res) => {
 });
 
 // GET a specific asset by MAC address
-app.get("/api/assets/:mac", (req, res) => {
+app.get("/api/assets/:mac", async (req, res) => {
   try {
     const mac = req.params.mac.toUpperCase();
-    const states = assetTracker.getAssetStates();
 
-    if (states[mac]) {
-      const state = states[mac];
-      const mapConfig = state.map_id ? getMapConfig(state.map_id) : null;
+    const asset = await assetTracker.getAssetCached(mac, {
+      force: req.query.force === "1",
+    });
 
-      let position_px = null;
-      if (state.position && mapConfig) {
-        position_px = {
-          x: state.position.x_m * mapConfig.ppm + mapConfig.origin_x,
-          y: mapConfig.origin_y - state.position.y_m * mapConfig.ppm,
-        };
-      }
-
-      res.json({
-        success: true,
-        asset: {
-          ...state,
-          position_px: position_px,
-          ap_mac: state.ap_mac || null,
-          beam: state.beam || null,
-          rssi: state.rssi || state.best_rssi || null,
-          raw_rssi: state.raw_rssi || null,
-        },
-      });
-    } else {
-      res.status(404).json({ success: false, error: "Asset not found" });
+    if (!asset) {
+      return res.status(404).json({ success: false, error: "Asset not found" });
     }
+
+    res.json({
+      success: true,
+      asset: {
+        ...asset,
+        position_px: asset.position_px || null,
+        ap_mac: asset.ap_mac || null,
+        beam: asset.beam ?? null,
+        rssi: asset.rssi ?? asset.best_rssi ?? null,
+        raw_rssi: asset.raw_rssi ?? null,
+      },
+    });
   } catch (error) {
     console.error("Error fetching asset:", error);
     res.status(500).json({ success: false, error: "Internal server error" });
@@ -171,9 +135,10 @@ app.get("/api/assets/:mac", (req, res) => {
 });
 
 // Force a manual poll of the Mist API
+// (bypasses Redis freshness, still respects 429 backoff)
 app.post("/api/assets/poll", async (req, res) => {
   try {
-    const results = await assetTracker.getAssets();
+    const results = await assetTracker.getAssetsCached({ force: true });
     res.json({
       success: true,
       message: "Poll completed",
@@ -202,62 +167,20 @@ connectDB().then(() => {
 });
 
 /* =======================
-   🔥 Asset Tracker – START POLLING (UPDATED)
+   🔥 Asset Tracker — Event Listeners Only
+   (No polling; tracker fetches on-demand when /api/assets is hit)
 ======================= */
-
-// New base interval: 30 seconds (safe for Mist rate limits)
-const ASSET_BASE_INTERVAL = 30000; // 30 seconds
-
-let pollInterval = null;
-
-function startPolling() {
-  if (pollInterval) clearInterval(pollInterval);
-
-  pollInterval = setInterval(async () => {
-    // Check if tracker is currently in backoff (rate-limited)
-    if (assetTracker.backoffUntil && assetTracker.backoffUntil > Date.now()) {
-      // Skip this poll; we'll try again later
-      return;
-    }
-    try {
-      await assetTracker.getAssets();
-    } catch (err) {
-      console.error("Asset poll error:", err);
-    }
-  }, ASSET_BASE_INTERVAL);
-}
-
-// Listen for rate‑limit events (optional logging / adjustments)
 assetTracker.on("rateLimited", ({ retryAfter, backoffMultiplier }) => {
   console.log(
-    `📡 Rate‑limit event – will retry after ${retryAfter}s (backoff multiplier: ${backoffMultiplier})`,
+    `📡 Rate-limit event – will retry after ${retryAfter}s (backoff multiplier: ${backoffMultiplier})`,
   );
-  // You could optionally increase the interval here, but assetTracker already handles backoff internally.
 });
 
-// Initial poll
-assetTracker
-  .getAssets()
-  .catch((err) => console.error("Initial asset poll error:", err));
-
-// Start the interval
-startPolling();
-
-// Listen for real‑time updates (log or forward via WebSocket)
 assetTracker.on("assetUpdate", (update) => {
+  const p = update.position || {};
   console.log(
-    `📍 ${update.mac} → (${update.position.x_m?.toFixed(2)}, ${update.position.y_m?.toFixed(2)})  |  RSSI: ${update.best_rssi} dBm  |  Stability: ${update.stability.toFixed(2)}`,
+    `📍 ${update.mac} → (${p.x_m?.toFixed(2)}, ${p.y_m?.toFixed(2)})  |  RSSI: ${update.best_rssi} dBm  |  Stability: ${update.stability?.toFixed(2)}`,
   );
-});
-
-/* =======================
-   Graceful Shutdown
-======================= */
-process.on("SIGINT", () => {
-  console.log("Shutting down gracefully...");
-  clearInterval(pollInterval);
-  // Close database connections, etc.
-  process.exit(0);
 });
 
 /* =======================
@@ -268,7 +191,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`🌐 Base URL: http://localhost:${PORT}`);
-  console.log(`📡 Asset polling interval: ${ASSET_BASE_INTERVAL}ms`);
+  console.log(`📡 Asset mode: on-demand Redis cache (no polling)`);
 
   if (process.env.NODE_ENV !== "production") {
     console.log("\n📂 ========== AVAILABLE ROUTES ==========\n");
@@ -282,4 +205,3 @@ app.listen(PORT, () => {
     console.log("\n========================================\n");
   }
 });
-// Last updated: 2026-08-29 - BLE Tag Management & Midnight Auto-Release enabled
