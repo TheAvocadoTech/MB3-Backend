@@ -1,11 +1,13 @@
 // services/mistAssetTracker.js
-// RAW SIGNAL MODE — no filtering, no smoothing, no trail.
+// RAW SIGNAL MODE — no filtering, no smoothing, no outlier rejection.
+// Keeps a simple in-memory rolling trail so the frontend can draw a path.
 //
 //   - Mist API hit only on cache miss / stale (with 429 backoff)
 //   - Redis cache layer (single-flight lock, TTL, stale-fallback)
 //   - Local AP list from ap_list.json (derives x_m/y_m from pixels)
 //   - Simple RSSI-weighted centroid of current detections only
-//   - Emits raw position + raw RSSI + primary AP + top APs
+//   - In-memory trail: last N centroid positions per MAC
+//   - Emits raw position + raw RSSI + primary AP + top APs + trail
 //
 // Exports a singleton EventEmitter.
 
@@ -166,14 +168,21 @@ const K = {
 };
 
 // ============================================================
-// AssetTracker (raw mode)
+// AssetTracker (raw mode + rolling trail)
 // ============================================================
 class AssetTracker extends EventEmitter {
   constructor(options = {}) {
     super();
 
-    this.MIN_RSSI = options.minRssi ?? -100; // effectively "no floor"
+    this.MIN_RSSI = options.minRssi ?? -100;
     this.TOP_APS_REPORT = options.topAps ?? 5;
+
+    // ---- Rolling trail config (raw mode) ----
+    this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 100;
+    this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 50;
+
+    // ---- In-memory trail (mac -> [{x_m, y_m, t}, ...]) ----
+    this.trails = new Map();
 
     // Backoff
     this.backoffUntil = 0;
@@ -273,6 +282,30 @@ class AssetTracker extends EventEmitter {
   }
 
   // ============================================================
+  // Trail helpers (in-memory, raw)
+  // ============================================================
+  _getTrail(mac) {
+    if (!this.trails.has(mac)) this.trails.set(mac, []);
+    return this.trails.get(mac);
+  }
+
+  _appendToTrail(mac, x_m, y_m, now) {
+    const trail = this._getTrail(mac);
+    trail.push({ x_m, y_m, t: now });
+    while (trail.length > this.TRAIL_MAX_POINTS) trail.shift();
+  }
+
+  _trailToPixels(trail, mapId) {
+    const cfg = MAP_CONFIGS[mapId];
+    if (!cfg) return trail.map((p) => ({ x: p.x_m, y: p.y_m, t: p.t }));
+    return trail.map((p) => ({
+      x: p.x_m * cfg.ppm + cfg.origin_x,
+      y: cfg.origin_y - p.y_m * cfg.ppm,
+      t: p.t,
+    }));
+  }
+
+  // ============================================================
   // PUBLIC API
   // ============================================================
   async getAssetsCached(opts = {}) {
@@ -307,7 +340,13 @@ class AssetTracker extends EventEmitter {
   async getAssetCached(mac, opts = {}) {
     if (this._redisReady && !opts.force) {
       const hit = await this._readOneFromRedis(mac);
-      if (hit && Date.now() - hit.updated_at <= FRESH_WINDOW_MS) return hit;
+      if (hit && Date.now() - hit.updated_at <= FRESH_WINDOW_MS) {
+        // Attach current in-memory trail
+        const trail = this._getTrail(mac);
+        hit.trail = [...trail];
+        hit.trail_px = this._trailToPixels(trail, hit.map_id);
+        return hit;
+      }
     }
     const all = await this.getAssetsCached({ force: true, allowStale: true });
     return all.find((a) => a.mac === mac) || null;
@@ -424,7 +463,12 @@ class AssetTracker extends EventEmitter {
     for (let i = 0; i < macs.length; i++) {
       const hash = results[i];
       if (!hash || Object.keys(hash).length === 0) continue;
-      assets.push(this._hashToAsset(hash));
+      const asset = this._hashToAsset(hash);
+      // Attach in-memory trail
+      const trail = this._getTrail(asset.mac);
+      asset.trail = [...trail];
+      asset.trail_px = this._trailToPixels(trail, asset.map_id);
+      assets.push(asset);
     }
     return assets;
   }
@@ -433,7 +477,11 @@ class AssetTracker extends EventEmitter {
     if (!this._redisReady) return null;
     const hash = await redis.hGetAll(K.asset(mac));
     if (!hash || Object.keys(hash).length === 0) return null;
-    return this._hashToAsset(hash);
+    const asset = this._hashToAsset(hash);
+    const trail = this._getTrail(asset.mac);
+    asset.trail = [...trail];
+    asset.trail_px = this._trailToPixels(trail, asset.map_id);
+    return asset;
   }
 
   _hashToAsset(hash) {
@@ -462,6 +510,9 @@ class AssetTracker extends EventEmitter {
       is_moving: hash.is_moving === "1",
       is_most_accurate: hash.is_most_accurate === "1",
       updated_at: parseInt(hash.updated_at, 10) || 0,
+      // trail added by caller
+      trail: [],
+      trail_px: [],
     };
   }
 
@@ -518,15 +569,18 @@ class AssetTracker extends EventEmitter {
   }
 
   getAssetStates() {
-    // Raw mode: nothing cached in memory — read from Redis instead.
     return {};
   }
 
-  getAssetTrail() {
-    return [];
+  getAssetTrail(mac) {
+    return [...this._getTrail(mac)];
   }
-  clearAssetTrail() {}
-  resetAsset() {}
+  clearAssetTrail(mac) {
+    this.trails.set(mac, []);
+  }
+  resetAsset(mac) {
+    this.trails.delete(mac);
+  }
   setWayfindingData() {}
 
   // ============================================================
@@ -552,13 +606,13 @@ class AssetTracker extends EventEmitter {
           continue;
         }
 
-        // ---- Pick the strongest detection (raw RSSI, no EMA) ----
+        // ---- Pick the strongest detection (raw RSSI) ----
         let primaryDet = detections[0];
         for (const d of detections) {
           if ((d.rssi ?? -999) > (primaryDet.rssi ?? -999)) primaryDet = d;
         }
 
-        // ---- Simple RSSI-weighted centroid (only computation kept) ----
+        // ---- Simple RSSI-weighted centroid ----
         let sumX = 0,
           sumY = 0,
           sumW = 0;
@@ -589,7 +643,6 @@ class AssetTracker extends EventEmitter {
             continue;
           }
 
-          // linear weight (simplest possible)
           const w = Math.max(1, det.rssi + 100); // dBm → 0..100
           sumX += x_m * w;
           sumY += y_m * w;
@@ -607,8 +660,7 @@ class AssetTracker extends EventEmitter {
         const topApsSliced = topAps.slice(0, this.TOP_APS_REPORT);
 
         if (sumW === 0) {
-          // No usable anchors this round — skip update
-          continue;
+          continue; // no usable anchors this round
         }
 
         const measurementX = sumX / sumW;
@@ -619,15 +671,25 @@ class AssetTracker extends EventEmitter {
 
         const apInfo = this.apMap.get(primaryDet.ap_mac);
 
+        // ---- Append raw centroid to in-memory trail ----
+        const now = Date.now();
+        this._appendToTrail(mac, measurementX, measurementY, now);
+
+        const fullTrail = this._getTrail(mac);
+        const trailTail = fullTrail.slice(-this.TRAIL_EMIT_POINTS);
+        const trailTailPx = this._trailToPixels(trailTail, firstDet.map_id);
+
         const out = {
           mac,
           device_name: firstDet.device_name || "Unknown",
           map_id: firstDet.map_id,
           position,
+          trail: [...trailTail],
+          trail_px: trailTailPx,
           ap_mac: primaryDet.ap_mac,
           ap_name: apInfo?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
-          best_rssi: primaryDet.rssi, // raw mode: same as rssi
+          best_rssi: primaryDet.rssi,
           beam: primaryDet.beam ?? null,
           anchor_count: anchorCount,
           topAps: topApsSliced,
@@ -644,6 +706,8 @@ class AssetTracker extends EventEmitter {
           mac,
           device_name: out.device_name,
           position,
+          trail: [...trailTail],
+          trail_px: trailTailPx,
           raw_position_px: {
             x:
               measurementX * ppm +
@@ -659,7 +723,7 @@ class AssetTracker extends EventEmitter {
           rssi: primaryDet.rssi,
           best_rssi: primaryDet.rssi,
           beam: primaryDet.beam ?? null,
-          timestamp: Date.now(),
+          timestamp: now,
           topAps: topApsSliced,
         });
       } catch (err) {
@@ -696,11 +760,13 @@ class AssetTracker extends EventEmitter {
 }
 
 // ============================================================
-// Export singleton — RAW MODE
+// Export singleton — RAW MODE + rolling trail
 // ============================================================
 const options = {
-  minRssi: -100, // accept everything from Mist
-  topAps: 5, // how many APs to include in the emit payload
+  minRssi: -100,
+  topAps: 5,
+  trailMaxPoints: 100, // keep last 100 raw centroid points per MAC
+  trailEmitPoints: 50, // send last 50 to frontend
 };
 
 const assetTracker = new AssetTracker(options);
@@ -709,7 +775,7 @@ const assetTracker = new AssetTracker(options);
   try {
     await assetTracker.initRedis();
     console.log(
-      "✅ mistAssetTracker loaded — RAW MODE (no filters, no smoothing, no trail)",
+      "✅ mistAssetTracker loaded — RAW MODE + rolling trail (no smoothing, no filters)",
     );
   } catch (e) {
     console.error("❌ Redis init failed:", e.message);

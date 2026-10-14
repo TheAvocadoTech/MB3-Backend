@@ -63,46 +63,21 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
-// const fetchAssetLocations = async () => {
-//   try {
-//     const processedAssets = await AssetTracker.getAssets();
-//     return processedAssets;
-//   } catch (error) {
-//     console.error("❌ Mist API Error:", error.response?.data || error.message);
-//     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
-//     console.log("📡 Fetching assets from Mist API:", url);
-//     const response = await axios.get(url, {
-//       headers: getMistHeaders(),
-//     });
-//     console.log(`✅ Found ${response.data.length} assets`);
-//     return response.data;
-//   }
-// };
-
-// ============================
-// WAYFINDING PATH HELPERS
-// ============================
+// ✅ FIXED: no more broken getCachedAssets() fast-path and no more getAssets()
 const fetchAssetLocations = async () => {
   try {
-    // Get cached assets from AssetTracker (no API call)
-    const cachedAssets = AssetTracker.getCachedAssets();
-    if (cachedAssets && cachedAssets.length > 0) {
-      console.log(
-        `✅ Using ${cachedAssets.length} cached assets (no API call)`,
-      );
-      return cachedAssets;
-    }
-
-    // Fallback: if cache is empty, force a fresh fetch (this will call the API)
-    console.log("⚠️ Cache empty, fetching from Mist API...");
-    const processedAssets = await AssetTracker.getAssets();
+    // getAssetsCached() internally checks Redis freshness (FRESH_WINDOW_MS).
+    // When stale or missing, it fetches from Mist, writes to Redis, and returns.
+    const processedAssets = await AssetTracker.getAssetsCached({
+      force: false,
+    });
     return processedAssets;
   } catch (error) {
     console.error(
       "❌ Mist API Error (fallback):",
       error.response?.data || error.message,
     );
-    // Final fallback: direct API call (if AssetTracker fails)
+    // Final fallback: direct API call
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
     const response = await axios.get(url, {
       headers: getMistHeaders(),
@@ -110,6 +85,7 @@ const fetchAssetLocations = async () => {
     return response.data;
   }
 };
+
 const fetchMapDetails = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
@@ -507,8 +483,6 @@ exports.getVisitorRoute = async (req, res) => {
             wayfindingPath.nodes &&
             wayfindingPath.nodes.length > 0
           ) {
-            // const targetX = 5525.298750495607;
-            // const targetY = 2491.837930104785;
             const targetX = 5625.298750495607;
             const targetY = 2200.837930104785;
 
@@ -529,8 +503,6 @@ exports.getVisitorRoute = async (req, res) => {
       }
     }
 
-    // const targetX = 5525.298750495607;
-    // const targetY = 2491.837930104785;
     const targetX = 5625.298750495607;
     const targetY = 2200.837930104785;
 

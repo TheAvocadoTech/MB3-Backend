@@ -4,12 +4,15 @@ const assetTracker = require("./src/services/mistAssetTracker");
 // Example usage with polling
 async function updateAssets() {
   try {
-    const processedAssets = await assetTracker.getAssets();
+    // ✅ FIXED: getAssetsCached() is the raw-mode public API
+    const processedAssets = await assetTracker.getAssetsCached({ force: true });
 
     // Process the smoothed asset data
     console.log(`Processed ${processedAssets.length} assets`);
 
     // Access individual asset states
+    // NOTE: raw-mode tracker returns {} here (no in-memory state).
+    //       Use processedAssets[] instead — it already has position + rssi.
     const allStates = assetTracker.getAssetStates();
     for (const [mac, state] of Object.entries(allStates)) {
       console.log(`Asset ${mac}:`, {
@@ -31,8 +34,8 @@ assetTracker.on("assetUpdate", (update) => {
   console.log(`Asset ${update.mac} updated:`, {
     position: update.position,
     stability: update.stability,
-    ap: update.raw.ap_mac,
-    rssi: update.raw.rssi,
+    ap: update.primary_ap_mac, // ✅ changed: raw mode uses primary_ap_mac
+    rssi: update.rssi, // ✅ changed: raw mode exposes rssi at top level
   });
 
   // You can emit this to your frontend via WebSocket
