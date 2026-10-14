@@ -1661,7 +1661,7 @@ const options = {
   minApCount: 3,
 
   // ---- Dynamic trail + hygiene ----
-  useTrail: true,
+  useTrail: false,
   trailMaxPoints: 300,
   trailMinMoveM: 0.5,
   trailMaxAgeMs: 5 * 60 * 1000,
