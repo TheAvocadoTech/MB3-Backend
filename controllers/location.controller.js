@@ -137,6 +137,183 @@ const fetchMapDetails = async (mapId) => {
   }
 };
 
+// const fetchWayfindingPath = async (mapId) => {
+//   try {
+//     const mapDetails = await fetchMapDetails(mapId);
+//     if (!mapDetails) {
+//       console.log(`❌ Map ${mapId} not found`);
+//       return null;
+//     }
+
+//     console.log(`🗺️ Checking map ${mapId} for wayfinding data...`);
+//     if (!mapDetails.wayfinding_path) {
+//       console.log(`⚠️ No wayfinding_path found in map ${mapId}`);
+//       return null;
+//     }
+
+//     const wayfindingData = mapDetails.wayfinding_path;
+//     if (
+//       !wayfindingData.nodes ||
+//       !Array.isArray(wayfindingData.nodes) ||
+//       wayfindingData.nodes.length === 0
+//     ) {
+//       console.log(`⚠️ Wayfinding data has no nodes for map ${mapId}`);
+//       return null;
+//     }
+
+//     console.log(
+//       `✅ Found ${wayfindingData.nodes.length} wayfinding nodes in map details`,
+//     );
+
+//     const transformedNodes = wayfindingData.nodes.map((node) => {
+//       let edges = node.edges || {};
+//       if (typeof edges === "object" && !Array.isArray(edges)) {
+//         const edgeObj = {};
+//         Object.keys(edges).forEach((key) => {
+//           edgeObj[key] = { weight: parseInt(edges[key]) || 1 };
+//         });
+//         edges = edgeObj;
+//       }
+//       return {
+//         ...node,
+//         edges: edges,
+//       };
+//     });
+
+//     const edges = {};
+//     transformedNodes.forEach((node) => {
+//       edges[node.name] = node.edges || {};
+//     });
+
+//     const result = {
+//       nodes: transformedNodes,
+//       edges: edges,
+//     };
+
+//     console.log(`✅ Processed ${result.nodes.length} nodes with edges`);
+//     console.log(`📋 Node names:`, result.nodes.map((n) => n.name).join(", "));
+
+//     return result;
+//   } catch (error) {
+//     console.error("❌ Error fetching wayfinding path:", error.message);
+//     return null;
+//   }
+// };
+// ============================
+// FALLBACK WAYFINDING GRAPHS
+// Used when Mist doesn't have a wayfinding_path for a map.
+// Coordinates are in the map's pixel space.
+// ============================
+
+const FALLBACK_WAYFINDING = {
+  // Ground Floor — MB3-F00
+  "30141417-44ea-4982-993c-6225c9f08315": {
+    nodes: [
+      // Corridor junctions around the tag zone (N12 / N13 / N19)
+      {
+        name: "n12",
+        position: { x: 5180, y: 1650 },
+        edges: { n13: 1, n19: 1 },
+      },
+      {
+        name: "n13",
+        position: { x: 5430, y: 1650 },
+        edges: { n12: 1, ap19: 1, ap18: 1 },
+      },
+      {
+        name: "n19",
+        position: { x: 5180, y: 1950 },
+        edges: { n12: 1, ap22: 1 },
+      },
+      {
+        name: "ap19",
+        position: { x: 5296, y: 1722 },
+        edges: { n13: 1, target: 1 },
+      },
+      {
+        name: "ap18",
+        position: { x: 5730, y: 1812 },
+        edges: { n13: 1, ap23: 1 },
+      },
+      {
+        name: "ap23",
+        position: { x: 5494, y: 2010 },
+        edges: { ap18: 1, ap22: 1 },
+      },
+      {
+        name: "ap22",
+        position: { x: 5286, y: 2166 },
+        edges: { n19: 1, ap23: 1 },
+      },
+      {
+        name: "target",
+        position: { x: 5625, y: 2200 },
+        edges: { ap19: 1, ap23: 1 },
+      },
+    ],
+    edges: {},
+  },
+};
+
+// Build edges map from node list
+function _buildEdgesFromNodes(nodes) {
+  const edges = {};
+  nodes.forEach((n) => {
+    edges[n.name] = n.edges || {};
+  });
+  return edges;
+}
+
+const fetchMapDetails = async (mapId) => {
+  try {
+    const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
+    console.log(`🗺️ Fetching map details for ${mapId}:`, url);
+    const response = await axios.get(url, { headers: getMistHeaders() });
+    const data = response.data;
+
+    console.log("📋 Map details received:", {
+      id: data.id,
+      name: data.name,
+      ppm: data.ppm,
+      origin_x: data.origin_x,
+      origin_y: data.origin_y,
+      width: data.width,
+      height: data.height,
+      hasWayfinding: !!data.wayfinding_path,
+      nodesCount: data.wayfinding_path?.nodes?.length || 0,
+    });
+
+    return {
+      id: data.id,
+      name: data.name,
+      width: data.width,
+      height: data.height,
+      ppm: data.ppm,
+      origin_x: data.origin_x,
+      origin_y: data.origin_y,
+      orientation: data.orientation,
+      created_time: data.created_time,
+      modified_time: data.modified_time,
+      type: data.type,
+      width_m: data.width_m,
+      height_m: data.height_m,
+      site_id: data.site_id,
+      org_id: data.org_id,
+      url: data.url,
+      thumbnail_url: data.thumbnail_url,
+      mapstack_id: data.mapstack_id,
+      mapstack_floor: data.mapstack_floor,
+      wayfinding_path: data.wayfinding_path || null,
+      wall_path: data.wall_path || null,
+    };
+  } catch (error) {
+    console.error("❌ Map API Error:", error.response?.data || error.message);
+    return null;
+  }
+};
+
+// ✅ UPDATED: uses Mist wayfinding if present, otherwise falls back
+//             to the hardcoded graph above for maps we know.
 const fetchWayfindingPath = async (mapId) => {
   try {
     const mapDetails = await fetchMapDetails(mapId);
@@ -145,61 +322,55 @@ const fetchWayfindingPath = async (mapId) => {
       return null;
     }
 
-    console.log(`🗺️ Checking map ${mapId} for wayfinding data...`);
-    if (!mapDetails.wayfinding_path) {
-      console.log(`⚠️ No wayfinding_path found in map ${mapId}`);
-      return null;
-    }
-
-    const wayfindingData = mapDetails.wayfinding_path;
+    // ---- Try Mist's own wayfinding first ----
     if (
-      !wayfindingData.nodes ||
-      !Array.isArray(wayfindingData.nodes) ||
-      wayfindingData.nodes.length === 0
+      mapDetails.wayfinding_path &&
+      Array.isArray(mapDetails.wayfinding_path.nodes) &&
+      mapDetails.wayfinding_path.nodes.length > 0
     ) {
-      console.log(`⚠️ Wayfinding data has no nodes for map ${mapId}`);
-      return null;
+      console.log(
+        `✅ Using Mist wayfinding_path (${mapDetails.wayfinding_path.nodes.length} nodes)`,
+      );
+
+      const transformedNodes = mapDetails.wayfinding_path.nodes.map((node) => {
+        let edges = node.edges || {};
+        if (typeof edges === "object" && !Array.isArray(edges)) {
+          const edgeObj = {};
+          Object.keys(edges).forEach((key) => {
+            edgeObj[key] = { weight: parseInt(edges[key]) || 1 };
+          });
+          edges = edgeObj;
+        }
+        return { ...node, edges };
+      });
+
+      const edges = {};
+      transformedNodes.forEach((node) => {
+        edges[node.name] = node.edges || {};
+      });
+
+      return { nodes: transformedNodes, edges };
     }
 
-    console.log(
-      `✅ Found ${wayfindingData.nodes.length} wayfinding nodes in map details`,
-    );
-
-    const transformedNodes = wayfindingData.nodes.map((node) => {
-      let edges = node.edges || {};
-      if (typeof edges === "object" && !Array.isArray(edges)) {
-        const edgeObj = {};
-        Object.keys(edges).forEach((key) => {
-          edgeObj[key] = { weight: parseInt(edges[key]) || 1 };
-        });
-        edges = edgeObj;
-      }
+    // ---- Fall back to hardcoded graph ----
+    const fallback = FALLBACK_WAYFINDING[mapId];
+    if (fallback) {
+      console.log(
+        `⚡ Using FALLBACK wayfinding for ${mapDetails.name} (${fallback.nodes.length} nodes)`,
+      );
       return {
-        ...node,
-        edges: edges,
+        nodes: fallback.nodes,
+        edges: _buildEdgesFromNodes(fallback.nodes),
       };
-    });
+    }
 
-    const edges = {};
-    transformedNodes.forEach((node) => {
-      edges[node.name] = node.edges || {};
-    });
-
-    const result = {
-      nodes: transformedNodes,
-      edges: edges,
-    };
-
-    console.log(`✅ Processed ${result.nodes.length} nodes with edges`);
-    console.log(`📋 Node names:`, result.nodes.map((n) => n.name).join(", "));
-
-    return result;
+    console.log(`⚠️ No wayfinding data (Mist or fallback) for map ${mapId}`);
+    return null;
   } catch (error) {
     console.error("❌ Error fetching wayfinding path:", error.message);
     return null;
   }
 };
-
 const findNearestNode = (wayfindingPath, assetX, assetY) => {
   if (
     !wayfindingPath ||
