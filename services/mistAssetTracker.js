@@ -40,13 +40,13 @@ const ASSET_TTL_SEC = parseInt(process.env.ASSET_TTL_SEC || "300", 10);
 // Freshness window — data younger than this is served from Redis as-is
 const FRESH_WINDOW_MS = parseInt(
   process.env.ASSET_FRESH_WINDOW_MS || "1500",
-  10
+  10,
 );
 
 // Single-flight lock TTL (concurrent requests share one Mist fetch)
 const FETCH_LOCK_TTL_MS = parseInt(
   process.env.ASSET_FETCH_LOCK_MS || "10000",
-  10
+  10,
 );
 
 const mist = axios.create({
@@ -63,38 +63,55 @@ const mist = axios.create({
 const MAP_CONFIGS = {
   "30141417-44ea-4982-993c-6225c9f08315": {
     name: "MB3-F00",
-    width: 6400, height: 5120,
+    width: 6400,
+    height: 5120,
     width_m: 127.81105527098556,
     height_m: 102.24884421678846,
     origin_x: 306.45106507695385,
     origin_y: 3856.483584010582,
     ppm: 50.07391564392213,
-    offset_x: 0, offset_y: 0,
+    offset_x: 0,
+    offset_y: 0,
   },
   "cfa55e13-794f-4081-b1b7-e35f1ea67325": {
     name: "MB3-F01",
-    width: 6400, height: 5120,
+    width: 6400,
+    height: 5120,
     width_m: 111.74050632911398,
     height_m: 89.39240506329119,
     origin_x: 6.786923314266026,
     origin_y: 4134.933029216576,
     ppm: 57.275559331634064,
-    offset_x: 0, offset_y: 0,
+    offset_x: 0,
+    offset_y: 0,
   },
   default: {
     name: "default",
-    width: 6400, height: 5120,
-    width_m: 50, height_m: 50,
-    origin_x: 0, origin_y: 0, ppm: 10,
-    offset_x: 0, offset_y: 0,
+    width: 6400,
+    height: 5120,
+    width_m: 50,
+    height_m: 50,
+    origin_x: 0,
+    origin_y: 0,
+    ppm: 10,
+    offset_x: 0,
+    offset_y: 0,
   },
 };
 
 // ============================================================
 // AP CORRECTIONS
+//
+// ⚠️ FIX #1 — MAC was "c878678aa2ab" but the real primary AP that
+// the tag is anchored to is "c878678aa0a8". With the wrong MAC,
+// the static-anchor pin NEVER fires and the raw AoA estimate is
+// used directly → tag jumps around.
+//
+// If you have more APs that need rotation / RSSI offsets, add
+// them here.
 // ============================================================
 const AP_CORRECTIONS = {
-  c878678aa2ab: {
+  c878678aa0a8: {
     rotationOffsetDeg: 180,
     rssiOffsetDb: +4,
     isStaticZoneAnchor: true,
@@ -140,7 +157,7 @@ class ParticleFilter {
       const dy = this.particles[i].y - my;
       const dist = Math.sqrt(dx * dx + dy * dy);
       const weight = Math.exp(
-        -(dist * dist) / (2 * this.measurementNoise * this.measurementNoise)
+        -(dist * dist) / (2 * this.measurementNoise * this.measurementNoise),
       );
       this.weights[i] = weight;
       totalWeight += weight;
@@ -172,7 +189,9 @@ class ParticleFilter {
   }
   getEstimate() {
     if (!this.initialized || this.particles.length === 0) return null;
-    let avgX = 0, avgY = 0, totalW = 0;
+    let avgX = 0,
+      avgY = 0,
+      totalW = 0;
     for (let i = 0; i < this.particles.length; i++) {
       avgX += this.particles[i].x * this.weights[i];
       avgY += this.particles[i].y * this.weights[i];
@@ -185,21 +204,27 @@ class ParticleFilter {
 
 // ============================================================
 // Stationary Drift Guard
+//
+// ⚠️ FIX #2 — thresholds raised:
+//   threshold         0.80 → 2.50 m   (hard lock radius)
+//   fastThreshold     1.50 → 4.00 m   (when to trust a jump)
+//   stationaryAlpha   0.02 → 0.005    (near-frozen when slow)
+//   movingAlpha       0.45 → 0.30     (softer blend when moving)
 // ============================================================
 class StationaryDriftGuard {
   static applyStationaryLock(state, candidateX, candidateY, cfg = {}) {
     const cur = state.currentPosition || state.currentPos;
-    const threshold = cfg.threshold ?? cfg.lockDistanceThreshold ?? 0.80;
-    const fastThreshold = cfg.fastThreshold ?? 1.5;
-    const stationaryAlpha = cfg.stationaryAlpha ?? 0.02;
-    const movingAlpha = cfg.movingAlpha ?? 0.45;
+    const threshold = cfg.threshold ?? cfg.lockDistanceThreshold ?? 2.5;
+    const fastThreshold = cfg.fastThreshold ?? 4.0;
+    const stationaryAlpha = cfg.stationaryAlpha ?? 0.005;
+    const movingAlpha = cfg.movingAlpha ?? 0.3;
 
     if (!cur) return { x: candidateX, y: candidateY, isMoving: true };
 
     const cx = cur.x_m;
     const cy = cur.y_m;
     const distFromCurrent = Math.sqrt(
-      (candidateX - cx) ** 2 + (candidateY - cy) ** 2
+      (candidateX - cx) ** 2 + (candidateY - cy) ** 2,
     );
 
     if (distFromCurrent < threshold) {
@@ -224,11 +249,11 @@ redis.on("error", (e) => console.error("❌ Redis error:", e.message));
 
 // Key schema
 const K = {
-  asset: (mac) => `mist:asset:${mac}`,          // HASH  — latest snapshot
-  trail: (mac) => `mist:asset:${mac}:trail`,    // LIST  — breadcrumb points
-  index: "mist:assets:index",                   // SET   — all known macs
-  meta: "mist:assets:meta",                     // HASH  — last_fetch_at, last_error
-  lock: "mist:assets:fetch_lock",               // STRING — single-flight lock
+  asset: (mac) => `mist:asset:${mac}`, // HASH  — latest snapshot
+  trail: (mac) => `mist:asset:${mac}:trail`, // LIST  — breadcrumb points
+  index: "mist:assets:index", // SET   — all known macs
+  meta: "mist:assets:meta", // HASH  — last_fetch_at, last_error
+  lock: "mist:assets:fetch_lock", // STRING — single-flight lock
 };
 
 // ============================================================
@@ -245,45 +270,61 @@ class AssetTracker extends EventEmitter {
 
     // --- Tuning ---
     this.EMA_ALPHA = options.emaAlpha ?? 0.15;
-    this.POSITION_ALPHA = options.positionAlpha ?? 0.25;
+    this.POSITION_ALPHA = options.positionAlpha ?? 0.15;
     this.HYSTERESIS_DB = options.hysteresisDb ?? 12;
     this.HYSTERESIS_COUNT = options.hysteresisCount ?? 4;
     this.TOP_APS = options.topAps ?? 3;
     this.STABILITY_THRESHOLD = options.stabilityThreshold ?? 3.0;
     this.OUTLIER_THRESHOLD = options.outlierThreshold ?? 5.0;
-    this.MIN_MOVE_METERS = options.minMoveMeters ?? 0.5;
-    this.MAX_SPEED_MS = options.maxSpeedMs ?? 2.0;
-    this.MIN_RSSI = options.minRssi ?? -75;
+
+    // ⚠️ FIX #5 — dead zone raised 0.5 → 1.5 m
+    this.MIN_MOVE_METERS = options.minMoveMeters ?? 1.5;
+
+    // ⚠️ FIX #5 — max speed lowered 2.0 → 1.5 m/s
+    this.MAX_SPEED_MS = options.maxSpeedMs ?? 1.5;
+
+    // ⚠️ FIX #4 — RSSI floor raised -75 → -68 dBm
+    this.MIN_RSSI = options.minRssi ?? -68;
+
     this.MAX_HISTORY = 7;
 
     this.HEATMAP_WINDOW = options.heatmapWindow ?? 30;
     this.HEATMAP_RADIUS = options.heatmapRadius ?? 2.0;
     this.PARTICLE_COUNT = options.particleCount ?? 100;
-    this.PARTICLE_NOISE = options.particleNoise ?? 0.5;
-    this.MEASUREMENT_NOISE = options.measurementNoise ?? 1.0;
+    this.PARTICLE_NOISE = options.particleNoise ?? 0.3;
+    this.MEASUREMENT_NOISE = options.measurementNoise ?? 1.5;
     this.USE_PARTICLE_FILTER = options.useParticleFilter ?? true;
     this.USE_HEATMAP = options.useHeatmap ?? true;
 
     // --- AP correction / static-anchor pinning ---
-    this.STRONG_RSSI_PIN_DB = options.strongRssiPinDb ?? -62;
-    this.PIN_DISTANCE_THRESHOLD_M = options.pinDistanceThresholdM ?? 5.0;
+    // ⚠️ FIX #1 — pin now only fires above -55 dBm (was -62)
+    this.STRONG_RSSI_PIN_DB = options.strongRssiPinDb ?? -55;
+    this.PIN_DISTANCE_THRESHOLD_M = options.pinDistanceThresholdM ?? 8.0;
 
     // --- Stationary Drift Guard ---
     this.USE_STATIONARY_GUARD = options.useStationaryGuard ?? true;
     this.STATIONARY_CFG = {
-      threshold: options.stationaryThresholdM ?? 0.80,
-      fastThreshold: options.stationaryFastThresholdM ?? 1.5,
-      stationaryAlpha: options.stationaryAlpha ?? 0.02,
-      movingAlpha: options.movingAlpha ?? 0.45,
+      threshold: options.stationaryThresholdM ?? 2.5,
+      fastThreshold: options.stationaryFastThresholdM ?? 4.0,
+      stationaryAlpha: options.stationaryAlpha ?? 0.005,
+      movingAlpha: options.movingAlpha ?? 0.3,
       ...(options.stationaryCfg || {}),
     };
 
     // --- Dynamic path (breadcrumb trail) ---
     this.USE_TRAIL = options.useTrail ?? true;
     this.TRAIL_MAX_POINTS = options.trailMaxPoints ?? 300;
-    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.25;
+    this.TRAIL_MIN_MOVE_M = options.trailMinMoveM ?? 0.5;
     this.TRAIL_MAX_AGE_MS = options.trailMaxAgeMs ?? 5 * 60 * 1000;
     this.TRAIL_EMIT_POINTS = options.trailEmitPoints ?? 100;
+
+    // --- Best-RSSI decay (FIX #3) ---
+    this.BEST_RSSI_DECAY_DB_PER_SEC = options.bestRssiDecayDbPerSec ?? 0.5;
+    this.BEST_RSSI_MIN_IMPROVEMENT = options.bestRssiMinImprovement ?? 2.0;
+    this.BEST_RSSI_MAX_DRIFT_M = options.bestRssiMaxDriftM ?? 3.0;
+
+    // --- Minimum AP count gate (FIX #4) ---
+    this.MIN_AP_COUNT = options.minApCount ?? 3;
 
     // --- Backoff ---
     this.backoffUntil = 0;
@@ -329,17 +370,17 @@ class AssetTracker extends EventEmitter {
         }
         this.apListFetched = true;
         console.log(
-          `✅ Loaded ${this.apMap.size} APs from ap_list.json (with corrections)`
+          `✅ Loaded ${this.apMap.size} APs from ap_list.json (with corrections)`,
         );
       } else {
         console.warn(
-          "⚠️ ap_list.json is empty – AP-centroid will fallback to Mist coords."
+          "⚠️ ap_list.json is empty – AP-centroid will fallback to Mist coords.",
         );
       }
     } catch (err) {
       console.warn(
         "⚠️ Could not load ap_list.json – AP-centroid will fallback.",
-        err.message
+        err.message,
       );
     }
   }
@@ -362,12 +403,6 @@ class AssetTracker extends EventEmitter {
   // PUBLIC API — callers use THESE (never call Mist directly)
   // ============================================================
 
-  /**
-   * Get all assets (cache-aside).
-   * @param {Object} opts
-   * @param {boolean} opts.force       - skip Redis freshness, hit Mist
-   * @param {boolean} opts.allowStale  - serve stale Redis data if Mist fails
-   */
   async getAssetsCached(opts = {}) {
     const { force = false, allowStale = true } = opts;
 
@@ -428,33 +463,26 @@ class AssetTracker extends EventEmitter {
   // Internal — single-flight fetch + persist
   // ============================================================
   async _fetchAndStore() {
-    // In-process lock: same Node process me duplicate fetch rokta hai
     if (this._inflightFetch) return this._inflightFetch;
 
-    // Cross-process lock: multi-instance deployments me dedupe
     if (this._redisReady) {
       const gotLock = await redis.set(K.lock, String(Date.now()), {
         NX: true,
         PX: FETCH_LOCK_TTL_MS,
       });
       if (!gotLock) {
-        // Koi aur fetch kar raha hai — wait karke Redis se padho
         await new Promise((r) => setTimeout(r, 250));
         const cached = await this._readAllFromRedis();
         if (cached.length > 0) return cached;
-        // warna khud fetch karo (fallback)
       }
     }
 
     this._inflightFetch = (async () => {
       try {
-        // Backoff check
         if (this.backoffUntil > Date.now()) {
-          const remaining = Math.ceil(
-            (this.backoffUntil - Date.now()) / 1000
-          );
+          const remaining = Math.ceil((this.backoffUntil - Date.now()) / 1000);
           console.log(
-            `⏳ Rate-limited – serving cache (${remaining}s remaining)`
+            `⏳ Rate-limited – serving cache (${remaining}s remaining)`,
           );
           return await this._readAllFromRedis();
         }
@@ -480,7 +508,6 @@ class AssetTracker extends EventEmitter {
           return processed;
         }
 
-        // Empty response — stale serve karo
         return await this._readAllFromRedis();
       } catch (err) {
         const status = err.response?.status;
@@ -493,8 +520,8 @@ class AssetTracker extends EventEmitter {
           this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, 8);
           console.error(
             `🚫 429 – retry after ${Math.ceil(
-              waitMs / 1000
-            )}s (multiplier ${this.backoffMultiplier})`
+              waitMs / 1000,
+            )}s (multiplier ${this.backoffMultiplier})`,
           );
           if (this._redisReady) {
             await redis.hSet(K.meta, { last_error: `429:${retryAfter}` });
@@ -543,7 +570,11 @@ class AssetTracker extends EventEmitter {
 
       const trail = (trailRaw || [])
         .map((s) => {
-          try { return JSON.parse(s); } catch { return null; }
+          try {
+            return JSON.parse(s);
+          } catch {
+            return null;
+          }
         })
         .filter(Boolean);
 
@@ -562,7 +593,11 @@ class AssetTracker extends EventEmitter {
 
     const trail = (trailRaw || [])
       .map((s) => {
-        try { return JSON.parse(s); } catch { return null; }
+        try {
+          return JSON.parse(s);
+        } catch {
+          return null;
+        }
       })
       .filter(Boolean);
     return this._hashToAsset(hash, trail);
@@ -652,7 +687,7 @@ class AssetTracker extends EventEmitter {
         const last = trail[trail.length - 1];
         pipeline.rPush(
           K.trail(mac),
-          JSON.stringify({ x_m: last.x_m, y_m: last.y_m, t: last.t || now })
+          JSON.stringify({ x_m: last.x_m, y_m: last.y_m, t: last.t || now }),
         );
         pipeline.lTrim(K.trail(mac), -this.TRAIL_MAX_POINTS, -1);
         pipeline.expire(K.trail(mac), ASSET_TTL_SEC);
@@ -670,8 +705,6 @@ class AssetTracker extends EventEmitter {
   // Public getters (legacy — Redis-backed)
   // ============================================================
   getCachedAssets() {
-    // Backward-compat: sync accessor returns last processed in-memory list.
-    // Prefer getAssetsCached() for correctness.
     return this.cachedProcessedAssets || [];
   }
 
@@ -731,7 +764,7 @@ class AssetTracker extends EventEmitter {
 
   setWayfindingData() {
     console.warn(
-      "⚠️ setWayfindingData() is deprecated — the tracker now builds the path dynamically from the tag's own trail."
+      "⚠️ setWayfindingData() is deprecated — the tracker now builds the path dynamically from the tag's own trail.",
     );
   }
 
@@ -858,7 +891,7 @@ class AssetTracker extends EventEmitter {
             state.particleFilter = new ParticleFilter(
               this.PARTICLE_COUNT,
               this.PARTICLE_NOISE,
-              this.MEASUREMENT_NOISE
+              this.MEASUREMENT_NOISE,
             );
           }
           this.assetStates.set(mac, state);
@@ -943,8 +976,11 @@ class AssetTracker extends EventEmitter {
 
         if (!primaryAP || !primaryAP.apMac) {
           state.apHistory.push({
-            ap_mac: null, rssi: null, beam: null,
-            timestamp: Date.now(), is_most_accurate: false,
+            ap_mac: null,
+            rssi: null,
+            beam: null,
+            timestamp: Date.now(),
+            is_most_accurate: false,
           });
           if (state.apHistory.length > 10) state.apHistory.shift();
           state.currentAP = null;
@@ -982,10 +1018,14 @@ class AssetTracker extends EventEmitter {
             const coords = this._convertCoordinates(det.x, det.y, det.map_id);
             if (coords && isFinite(coords.x_m) && isFinite(coords.y_m)) {
               const pre = this._preprocessDetection(
-                apMac, coords.x_m, coords.y_m, det.rssi
+                apMac,
+                coords.x_m,
+                coords.y_m,
+                det.rssi,
               );
               apPositions.push({
-                x_m: pre.x_m, y_m: pre.y_m,
+                x_m: pre.x_m,
+                y_m: pre.y_m,
                 weight: Math.pow(10, pre.correctedRssi / 10),
               });
             }
@@ -994,13 +1034,16 @@ class AssetTracker extends EventEmitter {
 
           const correctedRssi = det.rssi + (apInfo.rssiOffset || 0);
           apPositions.push({
-            x_m: apInfo.x_m, y_m: apInfo.y_m,
+            x_m: apInfo.x_m,
+            y_m: apInfo.y_m,
             weight: Math.pow(10, correctedRssi / 10),
           });
         }
 
         if (apPositions.length > 0) {
-          let sumX = 0, sumY = 0, sumW = 0;
+          let sumX = 0,
+            sumY = 0,
+            sumW = 0;
           for (const p of apPositions) {
             sumX += p.x_m * p.weight;
             sumY += p.y_m * p.weight;
@@ -1012,9 +1055,31 @@ class AssetTracker extends EventEmitter {
           }
         }
 
+        // ⚠️ FIX #4 — Require ≥ MIN_AP_COUNT anchors, otherwise do NOT move.
+        // This kills the vast majority of jumps when only 1–2 APs hear the
+        // tag and AoA noise dominates.
+        if (apPositions.length < this.MIN_AP_COUNT) {
+          state.apHistory.push({
+            ap_mac: primaryAP.apMac,
+            rssi: primaryAP.smoothedRssi,
+            beam: primaryDet?.beam || null,
+            timestamp: Date.now(),
+            is_most_accurate: false,
+          });
+          if (state.apHistory.length > 10) state.apHistory.shift();
+          state.currentAP = {
+            ap_mac: primaryAP.apMac,
+            rssi: primaryAP.smoothedRssi,
+            beam: primaryDet?.beam || null,
+          };
+          continue;
+        }
+
         if (measurementX === null || measurementY === null) {
           const topAps = sortedAPs.slice(0, this.TOP_APS);
-          let mX = 0, mY = 0, mW = 0;
+          let mX = 0,
+            mY = 0,
+            mW = 0;
           for (const { apMac, smoothedRssi } of topAps) {
             const det = detectionsMap.get(apMac);
             if (!det) continue;
@@ -1022,7 +1087,10 @@ class AssetTracker extends EventEmitter {
             if (!coords || !isFinite(coords.x_m) || !isFinite(coords.y_m))
               continue;
             const pre = this._preprocessDetection(
-              apMac, coords.x_m, coords.y_m, smoothedRssi
+              apMac,
+              coords.x_m,
+              coords.y_m,
+              smoothedRssi,
             );
             const w = Math.pow(10, pre.correctedRssi / 10);
             mX += pre.x_m * w;
@@ -1049,7 +1117,7 @@ class AssetTracker extends EventEmitter {
             primaryAP.apMac,
             primaryAP.smoothedRssi,
             measurementX,
-            measurementY
+            measurementY,
           );
           measurementX = pinned.x;
           measurementY = pinned.y;
@@ -1117,8 +1185,8 @@ class AssetTracker extends EventEmitter {
           if (dist > this.OUTLIER_THRESHOLD) {
             console.log(
               `🛑 Outlier rejected for ${mac}: ${dist.toFixed(
-                2
-              )}m from median – keeping previous`
+                2,
+              )}m from median – keeping previous`,
             );
             continue;
           }
@@ -1132,7 +1200,9 @@ class AssetTracker extends EventEmitter {
 
         if (this.USE_HEATMAP) {
           state.heatmapPositions.push({
-            x: filteredX, y: filteredY, t: Date.now(),
+            x: filteredX,
+            y: filteredY,
+            t: Date.now(),
           });
           if (state.heatmapPositions.length > this.HEATMAP_WINDOW) {
             state.heatmapPositions.shift();
@@ -1146,10 +1216,14 @@ class AssetTracker extends EventEmitter {
 
             for (let i = 0; i < points.length; i++) {
               let count = 0;
-              let sumX = 0, sumY = 0;
+              let sumX = 0,
+                sumY = 0;
               for (let j = 0; j < points.length; j++) {
                 const dist = this._distance(
-                  points[i].x, points[i].y, points[j].x, points[j].y
+                  points[i].x,
+                  points[i].y,
+                  points[j].x,
+                  points[j].y,
                 );
                 if (dist < this.HEATMAP_RADIUS) {
                   count++;
@@ -1188,13 +1262,32 @@ class AssetTracker extends EventEmitter {
         const ppm = MAP_CONFIGS[state.map_id]?.ppm ?? 50.0739;
         let newPos = { x_m: finalX, y_m: finalY, ppm };
 
-        // ---- Best position ----
+        // ---- Best position (⚠️ FIX #3 — decay + spatial gate) ----
         if (primaryDet) {
           const rssi = primaryDet.rssi;
-          if (rssi > state.bestRSSI) {
-            state.bestPosition = { ...newPos };
-            state.bestRSSI = rssi;
-            state.positionStable = true;
+
+          // Slow decay so a one-time RSSI peak doesn't latch forever
+          if (state.bestRSSI !== -Infinity && state.lastUpdateTime) {
+            const elapsed = (Date.now() - state.lastUpdateTime) / 1000;
+            state.bestRSSI -= this.BEST_RSSI_DECAY_DB_PER_SEC * elapsed;
+          }
+
+          // Only promote to "best" if meaningfully better AND spatially close
+          if (rssi > state.bestRSSI + this.BEST_RSSI_MIN_IMPROVEMENT) {
+            const nearCurrent =
+              !state.currentPosition ||
+              this._distance(
+                state.currentPosition.x_m,
+                state.currentPosition.y_m,
+                newPos.x_m,
+                newPos.y_m,
+              ) < this.BEST_RSSI_MAX_DRIFT_M;
+
+            if (nearCurrent) {
+              state.bestPosition = { ...newPos };
+              state.bestRSSI = rssi;
+              state.positionStable = true;
+            }
           }
         }
 
@@ -1202,7 +1295,10 @@ class AssetTracker extends EventEmitter {
         if (state.currentPosition) {
           const prevPos = state.currentPosition;
           const dist = this._distance(
-            prevPos.x_m, prevPos.y_m, newPos.x_m, newPos.y_m
+            prevPos.x_m,
+            prevPos.y_m,
+            newPos.x_m,
+            newPos.y_m,
           );
           if (dist > this.STABILITY_THRESHOLD) {
             if (state.bestPosition) {
@@ -1216,10 +1312,13 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // ---- Stationary Drift Guard ----
+        // ---- Stationary Drift Guard (⚠️ FIX #2 — tightened) ----
         if (this.USE_STATIONARY_GUARD) {
           const guarded = StationaryDriftGuard.applyStationaryLock(
-            state, newPos.x_m, newPos.y_m, this.STATIONARY_CFG
+            state,
+            newPos.x_m,
+            newPos.y_m,
+            this.STATIONARY_CFG,
           );
           newPos.x_m = guarded.x;
           newPos.y_m = guarded.y;
@@ -1237,13 +1336,12 @@ class AssetTracker extends EventEmitter {
         // ---- Append to dynamic trail ----
         this._appendToTrail(state, newPos.x_m, newPos.y_m, now);
 
-        // ---- Emit (dead-zone gated) ----
+        // ---- Emit (dead-zone gated, ⚠️ FIX #5 — 1.5 m dead zone) ----
         const lastEmit = state.lastEmittedPos;
         if (
           !lastEmit ||
-          this._distance(
-            lastEmit.x_m, lastEmit.y_m, newPos.x_m, newPos.y_m
-          ) >= this.MIN_MOVE_METERS
+          this._distance(lastEmit.x_m, lastEmit.y_m, newPos.x_m, newPos.y_m) >=
+            this.MIN_MOVE_METERS
         ) {
           const trail = state.positionTrail || [];
           const trailTail = trail.slice(-this.TRAIL_EMIT_POINTS);
@@ -1363,34 +1461,42 @@ class AssetTracker extends EventEmitter {
 // ============================================================
 const options = {
   emaAlpha: 0.15,
-  positionAlpha: 0.25,
+  positionAlpha: 0.15, // was 0.25  → smoother EMA fallback
   hysteresisDb: 12,
   hysteresisCount: 4,
   topAps: 3,
   stabilityThreshold: 3.0,
   outlierThreshold: 5.0,
-  minMoveMeters: 0.5,
-  maxSpeedMs: 2.0,
-  minRssi: -75,
+  minMoveMeters: 1.5, // was 0.5   → bigger dead zone for emit
+  maxSpeedMs: 1.5, // was 2.0   → slower max speed
+  minRssi: -68, // was -75   → stricter RSSI floor
   heatmapWindow: 30,
   heatmapRadius: 2.0,
   particleCount: 100,
-  particleNoise: 0.5,
-  measurementNoise: 1.0,
+  particleNoise: 0.3, // was 0.5   → less process noise
+  measurementNoise: 1.5, // was 1.0   → trust measurement less
   useParticleFilter: true,
   useHeatmap: true,
-  strongRssiPinDb: -62,
-  pinDistanceThresholdM: 5.0,
+  strongRssiPinDb: -55, // was -62   → pin only on really strong
+  pinDistanceThresholdM: 8.0, // was 5.0
   useStationaryGuard: true,
-  stationaryThresholdM: 0.80,
-  stationaryFastThresholdM: 1.5,
-  stationaryAlpha: 0.02,
-  movingAlpha: 0.45,
+  stationaryThresholdM: 2.5, // was 0.80  ← BIGGEST IMPACT
+  stationaryFastThresholdM: 4.0, // was 1.5
+  stationaryAlpha: 0.005, // was 0.02
+  movingAlpha: 0.3, // was 0.45
+
+  // ---- Best-RSSI decay (FIX #3) ----
+  bestRssiDecayDbPerSec: 0.5,
+  bestRssiMinImprovement: 2.0,
+  bestRssiMaxDriftM: 3.0,
+
+  // ---- Minimum AP count gate (FIX #4) ----
+  minApCount: 3,
 
   // ---- Dynamic trail ----
   useTrail: true,
   trailMaxPoints: 300,
-  trailMinMoveM: 0.25,
+  trailMinMoveM: 0.5, // was 0.25  → less trail jitter
   trailMaxAgeMs: 5 * 60 * 1000,
   trailEmitPoints: 100,
 };
@@ -1402,7 +1508,7 @@ const assetTracker = new AssetTracker(options);
   try {
     await assetTracker.initRedis();
     console.log(
-      "✅ mistAssetTracker loaded: on-demand Redis cache (no polling) + dynamic trail mode"
+      "✅ mistAssetTracker loaded: on-demand Redis cache (no polling) + dynamic trail mode",
     );
   } catch (e) {
     console.error("❌ Redis init failed:", e.message);
