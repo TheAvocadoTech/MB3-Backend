@@ -32,35 +32,6 @@ const MAP_CONFIGS = {
   },
 };
 
-// ============================
-// EXTRA WAYFINDING NODES
-// Injected into Mist's wayfinding graph at runtime.
-//
-// WHY: Mist's Ground Floor wayfinding has a GAP in the tag's zone
-// (no nodes between y=1900 and y=3200). The tag (~5430, 2435) and the
-// target (5625, 2201) both snap to the same node N7 → route has 0
-// segments → frontend draws no blue line.
-//
-// FIX: Add a TAG_ZONE node near the tag and a TARGET node at the
-// destination, and connect them. Now the route is TAG_ZONE → TARGET
-// with 1 segment → line renders.
-// ============================
-
-const EXTRA_NODES = {
-  "30141417-44ea-4982-993c-6225c9f08315": [
-    {
-      name: "TAG_ZONE",
-      position: { x: 5430, y: 2400 },
-      edges: { N7: 1, TARGET: 1 },
-    },
-    {
-      name: "TARGET",
-      position: { x: 5625.298750495607, y: 2200.837930104785 },
-      edges: { TAG_ZONE: 1 },
-    },
-  ],
-};
-
 // Beam angles for direction estimation
 const BEAM_ANGLES = {
   0: 0,
@@ -84,69 +55,6 @@ const BEAM_ANGLES = {
 };
 
 // ============================
-// FALLBACK WAYFINDING GRAPH
-// Used ONLY if Mist returns no wayfinding path at all for a map.
-// (In practice Mist already has a graph for MB3-F00, so this is
-// just a safety net.)
-// ============================
-
-const FALLBACK_WAYFINDING = {
-  "30141417-44ea-4982-993c-6225c9f08315": {
-    nodes: [
-      {
-        name: "n12",
-        position: { x: 5180, y: 1650 },
-        edges: { n13: 1, n19: 1 },
-      },
-      {
-        name: "n13",
-        position: { x: 5430, y: 1650 },
-        edges: { n12: 1, ap19: 1, ap18: 1 },
-      },
-      {
-        name: "n19",
-        position: { x: 5180, y: 1950 },
-        edges: { n12: 1, ap22: 1 },
-      },
-      {
-        name: "ap19",
-        position: { x: 5296, y: 1722 },
-        edges: { n13: 1, ap22: 1, target: 1 },
-      },
-      {
-        name: "ap18",
-        position: { x: 5730, y: 1812 },
-        edges: { n13: 1, ap23: 1 },
-      },
-      {
-        name: "ap23",
-        position: { x: 5494, y: 2010 },
-        edges: { ap18: 1, ap22: 1 },
-      },
-      {
-        name: "ap22",
-        position: { x: 5286, y: 2166 },
-        edges: { n19: 1, ap23: 1, ap19: 1 },
-      },
-      {
-        name: "target",
-        position: { x: 5625.298750495607, y: 2200.837930104785 },
-        edges: { ap19: 1, ap23: 1 },
-      },
-    ],
-    edges: {},
-  },
-};
-
-function _buildEdgesFromNodes(nodes) {
-  const edges = {};
-  nodes.forEach((n) => {
-    edges[n.name] = n.edges || {};
-  });
-  return edges;
-}
-
-// ============================
 // MIST API HELPERS
 // ============================
 
@@ -155,17 +63,46 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
+// const fetchAssetLocations = async () => {
+//   try {
+//     const processedAssets = await AssetTracker.getAssets();
+//     return processedAssets;
+//   } catch (error) {
+//     console.error("❌ Mist API Error:", error.response?.data || error.message);
+//     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
+//     console.log("📡 Fetching assets from Mist API:", url);
+//     const response = await axios.get(url, {
+//       headers: getMistHeaders(),
+//     });
+//     console.log(`✅ Found ${response.data.length} assets`);
+//     return response.data;
+//   }
+// };
+
+// ============================
+// WAYFINDING PATH HELPERS
+// ============================
 const fetchAssetLocations = async () => {
   try {
-    const processedAssets = await AssetTracker.getAssetsCached({
-      force: false,
-    });
+    // Get cached assets from AssetTracker (no API call)
+    const cachedAssets = AssetTracker.getCachedAssets();
+    if (cachedAssets && cachedAssets.length > 0) {
+      console.log(
+        `✅ Using ${cachedAssets.length} cached assets (no API call)`,
+      );
+      return cachedAssets;
+    }
+
+    // Fallback: if cache is empty, force a fresh fetch (this will call the API)
+    console.log("⚠️ Cache empty, fetching from Mist API...");
+    const processedAssets = await AssetTracker.getAssets();
     return processedAssets;
   } catch (error) {
     console.error(
       "❌ Mist API Error (fallback):",
       error.response?.data || error.message,
     );
+    // Final fallback: direct API call (if AssetTracker fails)
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
     const response = await axios.get(url, {
       headers: getMistHeaders(),
@@ -173,7 +110,6 @@ const fetchAssetLocations = async () => {
     return response.data;
   }
 };
-
 const fetchMapDetails = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
@@ -225,8 +161,6 @@ const fetchMapDetails = async (mapId) => {
   }
 };
 
-// ✅ UPDATED: Inject EXTRA_NODES into Mist's graph so Ground Floor
-//             has a node near the tag AND a distinct target node.
 const fetchWayfindingPath = async (mapId) => {
   try {
     const mapDetails = await fetchMapDetails(mapId);
@@ -235,86 +169,60 @@ const fetchWayfindingPath = async (mapId) => {
       return null;
     }
 
-    // ---- Use Mist's wayfinding path if present ----
+    console.log(`🗺️ Checking map ${mapId} for wayfinding data...`);
+    if (!mapDetails.wayfinding_path) {
+      console.log(`⚠️ No wayfinding_path found in map ${mapId}`);
+      return null;
+    }
+
+    const wayfindingData = mapDetails.wayfinding_path;
     if (
-      mapDetails.wayfinding_path &&
-      Array.isArray(mapDetails.wayfinding_path.nodes) &&
-      mapDetails.wayfinding_path.nodes.length > 0
+      !wayfindingData.nodes ||
+      !Array.isArray(wayfindingData.nodes) ||
+      wayfindingData.nodes.length === 0
     ) {
-      console.log(
-        `✅ Using Mist wayfinding_path (${mapDetails.wayfinding_path.nodes.length} nodes)`,
-      );
+      console.log(`⚠️ Wayfinding data has no nodes for map ${mapId}`);
+      return null;
+    }
 
-      const transformedNodes = mapDetails.wayfinding_path.nodes.map((node) => {
-        let edges = node.edges || {};
-        if (typeof edges === "object" && !Array.isArray(edges)) {
-          const edgeObj = {};
-          Object.keys(edges).forEach((key) => {
-            edgeObj[key] = { weight: parseInt(edges[key]) || 1 };
-          });
-          edges = edgeObj;
-        }
-        return { ...node, edges };
-      });
+    console.log(
+      `✅ Found ${wayfindingData.nodes.length} wayfinding nodes in map details`,
+    );
 
-      // ⚡ Inject EXTRA_NODES to fill gaps in Mist's graph
-      const extras = EXTRA_NODES[mapId] || [];
-      const existingNames = new Set(transformedNodes.map((n) => n.name));
-      for (const extra of extras) {
-        if (!existingNames.has(extra.name)) {
-          transformedNodes.push({
-            ...extra,
-            edges: { ...(extra.edges || {}) },
-          });
-          existingNames.add(extra.name);
-        } else {
-          const existing = transformedNodes.find((n) => n.name === extra.name);
-          existing.edges = { ...existing.edges, ...(extra.edges || {}) };
-        }
-      }
-
-      // Rebuild edges, make them bidirectional
-      const edges = {};
-      transformedNodes.forEach((n) => {
-        edges[n.name] = { ...(n.edges || {}) };
-      });
-      Object.keys(edges).forEach((src) => {
-        Object.keys(edges[src]).forEach((dst) => {
-          if (!edges[dst]) edges[dst] = {};
-          if (!edges[dst][src]) edges[dst][src] = { weight: 1 };
+    const transformedNodes = wayfindingData.nodes.map((node) => {
+      let edges = node.edges || {};
+      if (typeof edges === "object" && !Array.isArray(edges)) {
+        const edgeObj = {};
+        Object.keys(edges).forEach((key) => {
+          edgeObj[key] = { weight: parseInt(edges[key]) || 1 };
         });
-      });
-
-      console.log(
-        `✅ Wayfinding graph: ${transformedNodes.length} nodes after injecting extras`,
-      );
-
-      return { nodes: transformedNodes, edges };
-    }
-
-    // ---- Fall back to hardcoded graph ----
-    const fallback = FALLBACK_WAYFINDING[mapId];
-    if (fallback) {
-      console.log(
-        `⚡ Using FALLBACK wayfinding for ${mapDetails.name} (${fallback.nodes.length} nodes)`,
-      );
+        edges = edgeObj;
+      }
       return {
-        nodes: fallback.nodes,
-        edges: _buildEdgesFromNodes(fallback.nodes),
+        ...node,
+        edges: edges,
       };
-    }
+    });
 
-    console.log(`⚠️ No wayfinding data for map ${mapId}`);
-    return null;
+    const edges = {};
+    transformedNodes.forEach((node) => {
+      edges[node.name] = node.edges || {};
+    });
+
+    const result = {
+      nodes: transformedNodes,
+      edges: edges,
+    };
+
+    console.log(`✅ Processed ${result.nodes.length} nodes with edges`);
+    console.log(`📋 Node names:`, result.nodes.map((n) => n.name).join(", "));
+
+    return result;
   } catch (error) {
     console.error("❌ Error fetching wayfinding path:", error.message);
     return null;
   }
 };
-
-// ============================
-// WAYFINDING PATH HELPERS
-// ============================
 
 const findNearestNode = (wayfindingPath, assetX, assetY) => {
   if (
@@ -445,7 +353,7 @@ const convertWayfindingNodes = (nodes, mapData) => {
 };
 
 // ============================
-// GET VISITOR LOCATION WITH ROUTE
+// GET VISITOR LOCATION WITH ROUTE (FULLY IMPLEMENTED)
 // ============================
 
 exports.getVisitorRoute = async (req, res) => {
@@ -539,14 +447,14 @@ exports.getVisitorRoute = async (req, res) => {
     }
 
     const rawData = matchedAsset.raw || matchedAsset;
-    const smoothedPos = matchedAsset.position;
+    const smoothedPos = matchedAsset.position; // from AssetTracker
 
     console.log(
       "✅ Asset found:",
       rawData.mac || rawData.device_name || rawData.name,
     );
 
-    // ---- Resolve position (smoothed meters → pixels, or raw pixels) ----
+    // ---- ALWAYS USE SMOOTHED POSITION (if available) ----
     let assetX, assetY;
     let usedSmoothed = false;
     const currentMapId =
@@ -559,6 +467,7 @@ exports.getVisitorRoute = async (req, res) => {
       smoothedPos.x_m !== undefined &&
       smoothedPos.y_m !== undefined
     ) {
+      // Convert meters to pixels using ppm from map config
       const ppm = MAP_CONFIGS[currentMapId]?.ppm || 50.07391564392213;
       assetX = smoothedPos.x_m * ppm;
       assetY = smoothedPos.y_m * ppm;
@@ -580,7 +489,7 @@ exports.getVisitorRoute = async (req, res) => {
       });
     }
 
-    // ---- Fetch map + wayfinding + compute route ----
+    // Now assetX and assetY are valid pixel coordinates
     let mapDetails = null;
     let wayfindingPath = null;
     let nearestNode = null;
@@ -598,6 +507,8 @@ exports.getVisitorRoute = async (req, res) => {
             wayfindingPath.nodes &&
             wayfindingPath.nodes.length > 0
           ) {
+            // const targetX = 5525.298750495607;
+            // const targetY = 2491.837930104785;
             const targetX = 5625.298750495607;
             const targetY = 2200.837930104785;
 
@@ -618,15 +529,18 @@ exports.getVisitorRoute = async (req, res) => {
       }
     }
 
+    // const targetX = 5525.298750495607;
+    // const targetY = 2491.837930104785;
     const targetX = 5625.298750495607;
     const targetY = 2200.837930104785;
 
-    // PPM from map config
-    let ppm = 50.07391564392213;
+    // Get PPM from map config
+    let ppm = 50.07391564392213; // Default PPM
     if (currentMapId && MAP_CONFIGS[currentMapId]) {
       ppm = MAP_CONFIGS[currentMapId].ppm;
     }
 
+    // Calculate distance in pixels
     const distancePixels =
       assetX && assetY
         ? Math.sqrt(
@@ -634,6 +548,7 @@ exports.getVisitorRoute = async (req, res) => {
           )
         : null;
 
+    // Convert to METERS
     const distanceMeters =
       distancePixels !== null ? distancePixels / ppm : null;
 
@@ -659,6 +574,7 @@ exports.getVisitorRoute = async (req, res) => {
     const beamAngle =
       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
 
+    // 3D World Coordinates (in meters)
     const worldCoordinates = {
       x: smoothedPos ? smoothedPos.x_m : assetX / ppm,
       z: smoothedPos ? smoothedPos.y_m : assetY / ppm,
@@ -695,7 +611,10 @@ exports.getVisitorRoute = async (req, res) => {
         is_stable: isStable,
         used_smoothed: usedSmoothed,
         smoothed_position: matchedAsset.position || null,
-        pixel_coordinates: { x: assetX, y: assetY },
+        pixel_coordinates: {
+          x: assetX,
+          y: assetY,
+        },
         ap_history: matchedAsset.apHistory || [],
         world_coordinates: worldCoordinates,
       },
@@ -1015,7 +934,7 @@ exports.getNavigationRoute = async (req, res) => {
 };
 
 // ============================
-// GET ALL ASSET LOCATIONS
+// GET ALL ASSET LOCATIONS (ENHANCED)
 // ============================
 
 exports.getAllAssetLocations = async (req, res) => {
@@ -1065,7 +984,7 @@ exports.getAllAssetLocations = async (req, res) => {
 };
 
 // ============================
-// GET MAP DETAILS
+// GET MAP DETAILS (ENHANCED)
 // ============================
 
 exports.getMapDetails = async (req, res) => {
@@ -1167,7 +1086,7 @@ exports.resetAssetTracking = async (req, res) => {
 };
 
 // ============================
-// GET VISITOR CABINET
+// GET VISITOR CABINET (ENHANCED)
 // ============================
 
 exports.getVisitorCabinet = async (req, res) => {
@@ -1265,7 +1184,7 @@ exports.getVisitorCabinet = async (req, res) => {
 };
 
 // ============================
-// UPDATE VISITOR CABINET
+// UPDATE VISITOR CABINET (Enhanced with asset validation)
 // ============================
 
 exports.updateVisitorCabinet = async (req, res) => {
@@ -1297,7 +1216,7 @@ exports.updateVisitorCabinet = async (req, res) => {
 
     const newIdNumber = idNumber || assetName;
 
-    // Verify asset exists in Mist — abort if we can't reach Mist.
+    // Verify asset exists in Mist (optional but recommended)
     try {
       const assets = await fetchAssetLocations();
       const assetExists = assets.some((asset) => {
@@ -1315,16 +1234,8 @@ exports.updateVisitorCabinet = async (req, res) => {
         });
       }
     } catch (error) {
-      console.error(
-        "❌ Could not verify asset in Mist — aborting update:",
-        error.message,
-      );
-      return res.status(503).json({
-        success: false,
-        message:
-          "Could not verify asset in Mist right now (Mist API unreachable). Try again in a moment.",
-        error: error.message,
-      });
+      console.warn("⚠️ Could not verify asset in Mist:", error.message);
+      // Proceed anyway – the location endpoint will fail if asset not found
     }
 
     visitor.idNumber = newIdNumber;

@@ -85,10 +85,9 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
-// ✅ FIXED: uses getAssetsCached instead of removed getAssets()
 const fetchAssetLocations = async () => {
   try {
-    const processedAssets = await AssetTracker.getAssetsCached({ force: true });
+    const processedAssets = await AssetTracker.getAssets();
     return processedAssets;
   } catch (error) {
     console.error("Mist API Error:", error.response?.data || error.message);
@@ -1932,6 +1931,55 @@ exports.getVisitorCabinet = async (req, res) => {
 };
 
 // ===== UPDATE VISITOR CABINET =====
+// exports.updateVisitorCabinet = async (req, res) => {
+//   try {
+//     const { id } = req.params;
+//     const { idNumber, assetName } = req.body;
+
+//     if (!mongoose.Types.ObjectId.isValid(id)) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Invalid visitor ID",
+//       });
+//     }
+
+//     if (!idNumber && !assetName) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "idNumber or assetName is required",
+//       });
+//     }
+
+//     const visitor = await QRModel.findById(id);
+
+//     if (!visitor) {
+//       return res.status(404).json({
+//         success: false,
+//         message: "Visitor not found",
+//       });
+//     }
+
+//     visitor.idNumber = idNumber || assetName;
+//     await visitor.save();
+
+//     res.status(200).json({
+//       success: true,
+//       message: "Visitor cabinet updated successfully",
+//       data: {
+//         id: visitor._id,
+//         visitorName: visitor.visitorName,
+//         idNumber: visitor.idNumber,
+//       },
+//     });
+//   } catch (error) {
+//     console.error("Error updating visitor cabinet:", error);
+//     res.status(500).json({
+//       success: false,
+//       message: "Error updating visitor cabinet",
+//       error: error.message,
+//     });
+//   }
+// };
 // Only the relevant function – replace in your file
 exports.updateVisitorCabinet = async (req, res) => {
   try {
