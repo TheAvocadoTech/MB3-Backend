@@ -32,6 +32,35 @@ const MAP_CONFIGS = {
   },
 };
 
+// ============================
+// EXTRA WAYFINDING NODES
+// Injected into Mist's wayfinding graph at runtime.
+//
+// WHY: Mist's Ground Floor wayfinding has a GAP in the tag's zone
+// (no nodes between y=1900 and y=3200). The tag (~5430, 2435) and the
+// target (5625, 2201) both snap to the same node N7 → route has 0
+// segments → frontend draws no blue line.
+//
+// FIX: Add a TAG_ZONE node near the tag and a TARGET node at the
+// destination, and connect them. Now the route is TAG_ZONE → TARGET
+// with 1 segment → line renders.
+// ============================
+
+const EXTRA_NODES = {
+  "30141417-44ea-4982-993c-6225c9f08315": [
+    {
+      name: "TAG_ZONE",
+      position: { x: 5430, y: 2400 },
+      edges: { N7: 1, TARGET: 1 },
+    },
+    {
+      name: "TARGET",
+      position: { x: 5625.298750495607, y: 2200.837930104785 },
+      edges: { TAG_ZONE: 1 },
+    },
+  ],
+};
+
 // Beam angles for direction estimation
 const BEAM_ANGLES = {
   0: 0,
@@ -55,16 +84,15 @@ const BEAM_ANGLES = {
 };
 
 // ============================
-// FALLBACK WAYFINDING GRAPHS
-// Used when Mist doesn't have a wayfinding_path for a map.
-// Coordinates are in the map's pixel space.
+// FALLBACK WAYFINDING GRAPH
+// Used ONLY if Mist returns no wayfinding path at all for a map.
+// (In practice Mist already has a graph for MB3-F00, so this is
+// just a safety net.)
 // ============================
 
 const FALLBACK_WAYFINDING = {
-  // Ground Floor — MB3-F00
   "30141417-44ea-4982-993c-6225c9f08315": {
     nodes: [
-      // Corridor junctions around the tag zone (N12 / N13 / N19)
       {
         name: "n12",
         position: { x: 5180, y: 1650 },
@@ -100,7 +128,6 @@ const FALLBACK_WAYFINDING = {
         position: { x: 5286, y: 2166 },
         edges: { n19: 1, ap23: 1, ap19: 1 },
       },
-      // ⚡ IMPORTANT: matches the hardcoded targetX / targetY used below
       {
         name: "target",
         position: { x: 5625.298750495607, y: 2200.837930104785 },
@@ -128,11 +155,8 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
-// ✅ FIXED: no more broken getCachedAssets() fast-path and no more getAssets()
 const fetchAssetLocations = async () => {
   try {
-    // getAssetsCached() internally checks Redis freshness (FRESH_WINDOW_MS).
-    // When stale or missing, it fetches from Mist, writes to Redis, and returns.
     const processedAssets = await AssetTracker.getAssetsCached({
       force: false,
     });
@@ -142,7 +166,6 @@ const fetchAssetLocations = async () => {
       "❌ Mist API Error (fallback):",
       error.response?.data || error.message,
     );
-    // Final fallback: direct API call
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
     const response = await axios.get(url, {
       headers: getMistHeaders(),
@@ -151,7 +174,6 @@ const fetchAssetLocations = async () => {
   }
 };
 
-// ✅ Single definition of fetchMapDetails (removed the duplicate)
 const fetchMapDetails = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
@@ -203,8 +225,8 @@ const fetchMapDetails = async (mapId) => {
   }
 };
 
-// ✅ UPDATED: uses Mist wayfinding if present, otherwise falls back
-//             to the hardcoded graph above for maps we know.
+// ✅ UPDATED: Inject EXTRA_NODES into Mist's graph so Ground Floor
+//             has a node near the tag AND a distinct target node.
 const fetchWayfindingPath = async (mapId) => {
   try {
     const mapDetails = await fetchMapDetails(mapId);
@@ -213,7 +235,7 @@ const fetchWayfindingPath = async (mapId) => {
       return null;
     }
 
-    // ---- Try Mist's own wayfinding first ----
+    // ---- Use Mist's wayfinding path if present ----
     if (
       mapDetails.wayfinding_path &&
       Array.isArray(mapDetails.wayfinding_path.nodes) &&
@@ -235,10 +257,37 @@ const fetchWayfindingPath = async (mapId) => {
         return { ...node, edges };
       });
 
+      // ⚡ Inject EXTRA_NODES to fill gaps in Mist's graph
+      const extras = EXTRA_NODES[mapId] || [];
+      const existingNames = new Set(transformedNodes.map((n) => n.name));
+      for (const extra of extras) {
+        if (!existingNames.has(extra.name)) {
+          transformedNodes.push({
+            ...extra,
+            edges: { ...(extra.edges || {}) },
+          });
+          existingNames.add(extra.name);
+        } else {
+          const existing = transformedNodes.find((n) => n.name === extra.name);
+          existing.edges = { ...existing.edges, ...(extra.edges || {}) };
+        }
+      }
+
+      // Rebuild edges, make them bidirectional
       const edges = {};
-      transformedNodes.forEach((node) => {
-        edges[node.name] = node.edges || {};
+      transformedNodes.forEach((n) => {
+        edges[n.name] = { ...(n.edges || {}) };
       });
+      Object.keys(edges).forEach((src) => {
+        Object.keys(edges[src]).forEach((dst) => {
+          if (!edges[dst]) edges[dst] = {};
+          if (!edges[dst][src]) edges[dst][src] = { weight: 1 };
+        });
+      });
+
+      console.log(
+        `✅ Wayfinding graph: ${transformedNodes.length} nodes after injecting extras`,
+      );
 
       return { nodes: transformedNodes, edges };
     }
@@ -255,7 +304,7 @@ const fetchWayfindingPath = async (mapId) => {
       };
     }
 
-    console.log(`⚠️ No wayfinding data (Mist or fallback) for map ${mapId}`);
+    console.log(`⚠️ No wayfinding data for map ${mapId}`);
     return null;
   } catch (error) {
     console.error("❌ Error fetching wayfinding path:", error.message);
@@ -578,7 +627,6 @@ exports.getVisitorRoute = async (req, res) => {
       ppm = MAP_CONFIGS[currentMapId].ppm;
     }
 
-    // Distance in pixels → meters
     const distancePixels =
       assetX && assetY
         ? Math.sqrt(
@@ -1250,7 +1298,6 @@ exports.updateVisitorCabinet = async (req, res) => {
     const newIdNumber = idNumber || assetName;
 
     // Verify asset exists in Mist — abort if we can't reach Mist.
-    // Silently proceeding with a bad idNumber would store garbage.
     try {
       const assets = await fetchAssetLocations();
       const assetExists = assets.some((asset) => {
