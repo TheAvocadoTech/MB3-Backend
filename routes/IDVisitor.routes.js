@@ -25,6 +25,16 @@ router.get(
 );
 router.post("/visitors/scan-cabinets", visitorController.scanAndGetCabinets);
 
+// ============================
+// LOCATION TRACKING — SHORTCUT ROUTES
+// These MUST come before the generic /:id routes so that
+// "current" isn't interpreted as a Mongo ObjectId.
+// ============================
+
+// Live route for the currently-checked-in visitor (frontend polls this)
+router.get("/visitors/current/route", locationController.getVisitorRoute);
+router.get("/visitors/current/location", locationController.getVisitorRoute);
+
 // Get visitor dashboard (requires authentication)
 router.get(
   "/visitors/dashboard",
@@ -77,10 +87,10 @@ router.post("/visitors/:id/check-out", visitorController.checkOutVisitor);
 router.post("/visitors/:id/regenerate-qr", visitorController.regenerateQR);
 
 // ============================
-// LOCATION TRACKING ROUTES (UPDATED)
+// LOCATION TRACKING ROUTES
 // ============================
 
-// Get visitor location - NOW USING locationController
+// Get visitor location (full route payload)
 router.get("/visitors/:id/location", locationController.getVisitorRoute);
 
 // Get visitor navigation with wayfinding

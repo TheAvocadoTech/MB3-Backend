@@ -26,6 +26,11 @@ const IDvisitorRoutes = require("./routes/IDVisitor.routes");
 const CabinetRoutes = require("./routes/Cabinet.route");
 
 /* =======================
+   Controllers
+======================= */
+const locationController = require("./controllers/location.controller");
+
+/* =======================
    Middleware
 ======================= */
 app.use(helmet());
@@ -147,6 +152,101 @@ app.post("/api/assets/poll", async (req, res) => {
   } catch (error) {
     console.error("Manual poll failed:", error);
     res.status(500).json({ success: false, error: "Poll failed" });
+  }
+});
+
+/* =======================
+   🔥 VISITOR LIVE ROUTE
+   Frontend calls this once per second.
+   Response contains EVERYTHING the map needs:
+     - location.x, location.y                 (tag pixel position)
+     - target_coordinates.x, .y               (target pixel position)
+     - route.nodes[], route.start, route.end  (line to draw)
+     - distance, proximity
+======================= */
+
+// GET visitor's live location + full route
+// :id can be a Mongo ObjectId  OR  the literal string "current"
+// (the controller resolves "current" via the requesting session)
+app.get("/api/visitor/:id/route", (req, res, next) => {
+  // Delegate to the controller — it already handles "current" and ObjectId
+  return locationController.getVisitorRoute(req, res, next);
+});
+
+// GET visitor's live location ONLY (no route computation)
+// Useful for polling when the frontend just needs the dot position.
+app.get("/api/visitor/:id/location", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const force = req.query.force === "1";
+
+    // If "current" → look up by session/token (falls through to controller)
+    if (id === "current") {
+      return locationController.getVisitorRoute(req, res);
+    }
+
+    // Otherwise, fetch the visitor's asset directly from the tracker
+    const QRModel = require("./models/User/IdVisitorQR.model");
+    const mongoose = require("mongoose");
+
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid visitor ID" });
+    }
+
+    const visitor = await QRModel.findById(id);
+    if (!visitor) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Visitor not found" });
+    }
+
+    const mac = (visitor.tagMac || visitor.mistMacAddress || "").toUpperCase();
+    if (!mac) {
+      return res.status(404).json({
+        success: false,
+        message: "Visitor has no tag assigned",
+      });
+    }
+
+    const asset = await assetTracker.getAssetCached(mac, { force });
+    if (!asset) {
+      return res.status(404).json({
+        success: false,
+        message: "Tag not found in Mist",
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        visitor: {
+          id: visitor._id,
+          name: visitor.visitorName,
+          idNumber: visitor.idNumber,
+        },
+        location: {
+          x: asset.position_px?.x ?? null,
+          y: asset.position_px?.y ?? null,
+          mac: asset.mac,
+          map_id: asset.map_id,
+          ap_mac: asset.ap_mac,
+          rssi: asset.rssi,
+          beam: asset.beam,
+          pixel_coordinates: asset.position_px ?? null,
+          smoothed_position: asset.position ?? null,
+        },
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error) {
+    console.error("Error fetching visitor location:", error);
+    res.status(500).json({
+      success: false,
+      message: "Error fetching visitor location",
+      error: error.message,
+    });
   }
 });
 

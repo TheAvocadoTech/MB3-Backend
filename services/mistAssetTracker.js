@@ -197,6 +197,21 @@ class AssetTracker extends EventEmitter {
   }
 
   // ------------------------------------------------------------
+  // BACKWARD-COMPAT ALIASES
+  // Controllers call getAssetsCached() / getAssetCached() — raw
+  // mode has no cache window, so both just forward to getAssets().
+  // ------------------------------------------------------------
+  async getAssetsCached(opts = {}) {
+    return this.getAssets();
+  }
+
+  async getAssetCached(mac, opts = {}) {
+    const assets = await this.getAssets();
+    const target = (mac || "").toUpperCase();
+    return assets.find((a) => (a.mac || "").toUpperCase() === target) || null;
+  }
+
+  // ------------------------------------------------------------
   // Public: legacy stubs so old callers don't crash
   // ------------------------------------------------------------
   getAssetStates() {
