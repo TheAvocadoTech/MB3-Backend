@@ -2,9 +2,6 @@
 const QRModel = require("../models/User/IdVisitorQR.model");
 const axios = require("axios");
 const mongoose = require("mongoose");
-const AssetTracker = require("../services/mistAssetTracker");
-const path = require("path");
-const fs = require("fs");
 
 // ============================
 // MIST API CONFIGURATION
@@ -26,8 +23,6 @@ const MAP_CONFIGS = {
     name: "MB3-F00",
     width: 6400,
     height: 5120,
-    width_m: 127.81105527098556,
-    height_m: 102.24884421678846,
     origin_x: 306.45106507695385,
     origin_y: 3856.483584010582,
     ppm: 50.07391564392213,
@@ -36,8 +31,6 @@ const MAP_CONFIGS = {
     name: "MB3-F01",
     width: 6400,
     height: 5120,
-    width_m: 111.74050632911398,
-    height_m: 89.39240506329119,
     origin_x: 6.786923314266026,
     origin_y: 4134.933029216576,
     ppm: 57.275559331634064,
@@ -83,24 +76,6 @@ const BEAM_ANGLES = {
 };
 
 // ============================
-// LOAD AP DATA (For Centroid Calc)
-// ============================
-const AP_MAP = new Map();
-try {
-  const apListPath = path.join(__dirname, "../services/ap_list.json");
-  if (fs.existsSync(apListPath)) {
-    const apList = JSON.parse(fs.readFileSync(apListPath, "utf8"));
-    if (Array.isArray(apList)) {
-      for (const ap of apList) {
-        if (ap.mac) AP_MAP.set(ap.mac.toLowerCase().trim(), ap);
-      }
-    }
-  }
-} catch (err) {
-  console.warn("⚠️ Could not load ap_list.json in controller:", err.message);
-}
-
-// ============================
 // MIST API HELPERS
 // ============================
 
@@ -109,20 +84,54 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
-// FIXED: Properly falls back to fetching if cache is empty
+// Fetch assets DIRECTLY from Mist API (No Cache)
 const fetchAssetLocations = async () => {
-  try {
-    let assets = AssetTracker.getCachedAssets();
-    if (!assets || assets.length === 0) {
-      console.log("⚠️ Cache empty, fetching fresh assets from Mist...");
-      assets = await AssetTracker.getAssets();
+  const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
+  const response = await axios.get(url, { headers: getMistHeaders() });
+  const rawAssets = response.data;
+
+  // Group detections by MAC manually
+  const assetGroups = new Map();
+  for (const a of rawAssets) {
+    if (!a.mac) continue;
+    let group = assetGroups.get(a.mac);
+    if (!group) {
+      group = [];
+      assetGroups.set(a.mac, group);
     }
-    return assets;
-  } catch (error) {
-    console.error("❌ Mist API Error:", error.message);
-    const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
+    group.push(a);
+  }
+
+  const processed = [];
+  for (const [mac, detections] of assetGroups) {
+    detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
+    const primary = detections[0];
+    processed.push({
+      mac: mac,
+      device_name: primary.name || primary.device_name || "Unknown",
+      map_id: primary.map_id,
+      detections: detections,
+      ap_mac: primary.ap_mac,
+      rssi: primary.rssi,
+      beam: primary.beam,
+    });
+  }
+  return processed;
+};
+
+// Fetch live AP coordinates DIRECTLY from Mist API
+const fetchMistAPs = async (mapId) => {
+  try {
+    const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/maps/${mapId}/discovered_aps`;
     const response = await axios.get(url, { headers: getMistHeaders() });
-    return response.data;
+    const apMap = new Map();
+    for (const ap of response.data) {
+      if (ap.mac) apMap.set(ap.mac.toLowerCase().trim(), ap);
+    }
+    return apMap;
+  } catch (error) {
+    console.error(`❌ Failed to fetch APs from Mist:`, error.message);
+    return new Map();
   }
 };
 
@@ -130,23 +139,7 @@ const fetchMapDetails = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
     const response = await axios.get(url, { headers: getMistHeaders() });
-    const data = response.data;
-    return {
-      id: data.id,
-      name: data.name,
-      width: data.width,
-      height: data.height,
-      ppm: data.ppm,
-      origin_x: data.origin_x,
-      origin_y: data.origin_y,
-      orientation: data.orientation,
-      width_m: data.width_m,
-      height_m: data.height_m,
-      site_id: data.site_id,
-      org_id: data.org_id,
-      url: data.url,
-      thumbnail_url: data.thumbnail_url,
-    };
+    return response.data;
   } catch (error) {
     console.error("❌ Map API Error:", error.message);
     return null;
@@ -159,22 +152,16 @@ const fetchMapDetails = async (mapId) => {
 
 const convertMistToWorld = (pixelX, pixelY, mapData) => {
   if (!mapData || !mapData.ppm || mapData.origin_x === undefined) return null;
-  const { origin_x, origin_y, ppm } = mapData;
   return {
-    x: (pixelX - origin_x) / ppm,
-    z: -(pixelY - origin_y) / ppm,
+    x: (pixelX - mapData.origin_x) / mapData.ppm,
+    z: -(pixelY - mapData.origin_y) / mapData.ppm,
     y: 0.1,
   };
 };
 
 function buildRoute(fromPx, toPx, ppm = 50.07391564392213) {
   if (!fromPx || !toPx) return null;
-
-  const dx = toPx.x - fromPx.x;
-  const dy = toPx.y - fromPx.y;
-  const distPx = Math.hypot(dx, dy);
-  const distM = distPx / ppm;
-
+  const distPx = Math.hypot(toPx.x - fromPx.x, toPx.y - fromPx.y);
   return {
     nodes: [
       { name: "TAG", position: { x: fromPx.x, y: fromPx.y } },
@@ -182,7 +169,7 @@ function buildRoute(fromPx, toPx, ppm = 50.07391564392213) {
     ],
     path: ["TAG", "TARGET"],
     segments: 1,
-    distance: { pixels: distPx, meters: distM },
+    distance: { pixels: distPx, meters: distPx / ppm },
     start: { x: fromPx.x, y: fromPx.y },
     end: { x: toPx.x, y: toPx.y },
   };
@@ -198,7 +185,7 @@ async function resolveVisitorId(idOrCurrent, req) {
 }
 
 // ============================
-// GET VISITOR LOCATION (Centroid Math)
+// GET VISITOR LOCATION (Direct from Mist)
 // ============================
 
 exports.getVisitorRoute = async (req, res) => {
@@ -224,13 +211,12 @@ exports.getVisitorRoute = async (req, res) => {
         .status(404)
         .json({ success: false, message: "No ID assigned" });
 
+    // 1. Fetch directly from Mist
     const assets = await fetchAssetLocations();
-
-    // Diagnostic logging to see what Mist actually returned
     const assetNames = assets
       .map((a) => a.mac || a.device_name)
       .filter(Boolean);
-    console.log("📋 Available Assets:", assetNames.join(", "));
+    console.log("📋 Available Assets (Live from Mist):", assetNames.join(", "));
 
     const targetMac = (visitor.tagMac || visitor.mistMacAddress || "")
       .toLowerCase()
@@ -238,17 +224,21 @@ exports.getVisitorRoute = async (req, res) => {
     const targetIdNumber = (visitor.idNumber || "").toLowerCase().trim();
     const targetNickname = (visitor.tagNickname || "").toLowerCase().trim();
 
-    // FIXED: Matcher now looks at the root object properties which the tracker provides
     const matchedAsset = assets.find((asset) => {
       const aMac = (asset.mac || "").toLowerCase().trim();
       const aName = (asset.device_name || asset.name || "")
         .toLowerCase()
         .trim();
+      const detName = (asset.detections?.[0]?.name || "").toLowerCase().trim();
+
       return (
         (targetMac && aMac === targetMac) ||
         (targetIdNumber &&
-          (aName === targetIdNumber || aMac === targetIdNumber)) ||
-        (targetNickname && aName === targetNickname)
+          (aName === targetIdNumber ||
+            aMac === targetIdNumber ||
+            detName === targetIdNumber)) ||
+        (targetNickname &&
+          (aName === targetNickname || detName === targetNickname))
       );
     });
 
@@ -260,12 +250,17 @@ exports.getVisitorRoute = async (req, res) => {
       });
     }
 
-    // ---------- CENTROID CALCULATION ----------
+    // 2. Fetch live APs from Mist for this map
     const currentMapId =
       matchedAsset.map_id || "30141417-44ea-4982-993c-6225c9f08315";
-    const cfg = MAP_CONFIGS[currentMapId];
-    const ppm = cfg?.ppm || 50.07391564392213;
+    const cfg =
+      MAP_CONFIGS[currentMapId] ||
+      MAP_CONFIGS["30141417-44ea-4982-993c-6225c9f08315"];
+    const ppm = cfg.ppm;
 
+    const mistAPs = await fetchMistAPs(currentMapId);
+
+    // 3. Centroid Calculation
     let sumX = 0,
       sumY = 0,
       sumW = 0;
@@ -279,7 +274,8 @@ exports.getVisitorRoute = async (req, res) => {
         primaryDetection = det;
       }
 
-      const apInfo = AP_MAP.get((det.ap_mac || "").toLowerCase().trim());
+      // Look up the AP from the Mist API data
+      const apInfo = mistAPs.get((det.ap_mac || "").toLowerCase().trim());
       if (!apInfo) continue;
 
       let apX = null,
@@ -311,7 +307,8 @@ exports.getVisitorRoute = async (req, res) => {
       assetX = sumX / sumW;
       assetY = sumY / sumW;
     } else {
-      const primaryAp = AP_MAP.get(
+      // Fallback: Use primary AP location if centroid fails
+      const primaryAp = mistAPs.get(
         (primaryDetection?.ap_mac || "").toLowerCase().trim(),
       );
       if (primaryAp) {
@@ -325,15 +322,13 @@ exports.getVisitorRoute = async (req, res) => {
     }
 
     if (assetX === null || assetY === null) {
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `Asset "${matchedAsset.mac}" has no location data`,
-        });
+      return res.status(404).json({
+        success: false,
+        message: `Asset "${matchedAsset.mac}" has no location data`,
+      });
     }
 
-    // ---------- FETCH MAP & BUILD ROUTE ----------
+    // 4. Build Route
     const mapDetails = await fetchMapDetails(currentMapId).catch(() => null);
     const target = TARGETS_BY_MAP[currentMapId] || {
       x: 5625,
@@ -350,7 +345,7 @@ exports.getVisitorRoute = async (req, res) => {
       ? convertMistToWorld(assetX, assetY, mapDetails)
       : null;
 
-    // ---------- RESPONSE ----------
+    // 5. Return Response
     res.status(200).json({
       success: true,
       data: {
@@ -382,19 +377,7 @@ exports.getVisitorRoute = async (req, res) => {
           pixel_coordinates: { x: assetX, y: assetY },
           world_coordinates: worldCoords,
         },
-        map: mapDetails
-          ? {
-              id: mapDetails.id,
-              name: mapDetails.name,
-              width: mapDetails.width,
-              height: mapDetails.height,
-              ppm: mapDetails.ppm,
-              origin_x: mapDetails.origin_x,
-              origin_y: mapDetails.origin_y,
-              width_m: mapDetails.width_m,
-              height_m: mapDetails.height_m,
-            }
-          : null,
+        map: mapDetails,
         target_coordinates: { x: target.x, y: target.y, label: target.label },
         route,
         distance: route
@@ -416,20 +399,17 @@ exports.getVisitorRoute = async (req, res) => {
     });
   } catch (error) {
     console.error("❌ Error:", error);
-    res
-      .status(500)
-      .json({
-        success: false,
-        message: "Error fetching location",
-        error: error.message,
-      });
+    res.status(500).json({
+      success: false,
+      message: "Error fetching location",
+      error: error.message,
+    });
   }
 };
 
 // ============================
 // GET ALL ASSET LOCATIONS
 // ============================
-
 exports.getAllAssetLocations = async (req, res) => {
   try {
     const assets = await fetchAssetLocations();
@@ -444,7 +424,6 @@ exports.getAllAssetLocations = async (req, res) => {
 // ============================
 // GET MAP DETAILS
 // ============================
-
 exports.getMapDetails = async (req, res) => {
   try {
     const { mapId } = req.params;
@@ -466,7 +445,6 @@ exports.getMapDetails = async (req, res) => {
 // ============================
 // GET VISITOR CABINET
 // ============================
-
 exports.getVisitorCabinet = async (req, res) => {
   try {
     const { id } = req.params;
@@ -495,12 +473,10 @@ exports.getVisitorCabinet = async (req, res) => {
     });
 
     if (!cabinet)
-      return res
-        .status(404)
-        .json({
-          success: false,
-          message: `Cabinet "${visitor.idNumber}" not found`,
-        });
+      return res.status(404).json({
+        success: false,
+        message: `Cabinet "${visitor.idNumber}" not found`,
+      });
 
     res.status(200).json({
       success: true,
@@ -531,7 +507,6 @@ exports.getVisitorCabinet = async (req, res) => {
 // ============================
 // UPDATE VISITOR CABINET
 // ============================
-
 exports.updateVisitorCabinet = async (req, res) => {
   try {
     const { id } = req.params;
@@ -575,38 +550,27 @@ exports.updateVisitorCabinet = async (req, res) => {
 // ============================================================
 // LEGACY STUBS
 // ============================================================
-
-exports.getWayfindingPath = async (req, res) => {
-  res
-    .status(200)
-    .json({
-      success: true,
-      message: "Wayfinding disabled",
-      data: { map_id: req.params.mapId, nodes: [], edges: {} },
-    });
-};
-
-exports.getNavigationRoute = async (req, res) => {
+exports.getWayfindingPath = async (req, res) =>
+  res.status(200).json({
+    success: true,
+    message: "Wayfinding disabled",
+    data: { map_id: req.params.mapId, nodes: [], edges: {} },
+  });
+exports.getNavigationRoute = async (req, res) =>
   res
     .status(200)
     .json({ success: true, message: "Route disabled", data: null });
-};
-
-exports.testCoordinateConversion = async (req, res) => {
-  res
-    .status(200)
-    .json({
-      success: true,
-      message: "Coordinate conversion disabled",
-      data: null,
-    });
-};
-
+exports.testCoordinateConversion = async (req, res) =>
+  res.status(200).json({
+    success: true,
+    message: "Coordinate conversion disabled",
+    data: null,
+  });
 exports.getAssetTrackingState = async (req, res) => {
   try {
     const assets = await fetchAssetLocations();
     const states = {};
-    for (const a of assets) {
+    for (const a of assets)
       states[a.mac] = {
         device_name: a.device_name,
         position: a.position,
@@ -617,7 +581,6 @@ exports.getAssetTrackingState = async (req, res) => {
         beam: a.beam,
         lastUpdate: Date.now(),
       };
-    }
     res
       .status(200)
       .json({ success: true, total: Object.keys(states).length, data: states });
@@ -625,12 +588,9 @@ exports.getAssetTrackingState = async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 };
-
 exports.resetAssetTracking = async (req, res) => {
   try {
     const { mac } = req.params;
-    if (mac && typeof AssetTracker.resetAsset === "function")
-      AssetTracker.resetAsset(mac);
     res.status(200).json({ success: true, message: `Reset requested` });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
@@ -640,7 +600,6 @@ exports.resetAssetTracking = async (req, res) => {
 // ============================
 // EXPORTS
 // ============================
-
 module.exports = {
   getVisitorRoute: exports.getVisitorRoute,
   getAllAssetLocations: exports.getAllAssetLocations,
