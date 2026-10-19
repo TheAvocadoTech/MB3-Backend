@@ -604,4 +604,3 @@ module.exports = {
   getAssetTrackingState: exports.getAssetTrackingState,
   resetAssetTracking: exports.resetAssetTracking,
 };
-c;
