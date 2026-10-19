@@ -2,7 +2,8 @@
 const QRModel = require("../models/User/IdVisitorQR.model");
 const axios = require("axios");
 const mongoose = require("mongoose");
-const AssetTracker = require("../services/mistAssetTracker");
+const path = require("path");
+const fs = require("fs");
 
 // ============================
 // MIST API CONFIGURATION
@@ -77,7 +78,7 @@ const BEAM_ANGLES = {
 };
 
 // ============================
-// MIST API HELPERS
+// IN-MEMORY CACHE & API HELPERS
 // ============================
 
 const getMistHeaders = () => ({
@@ -85,23 +86,30 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
-// SAFE FETCHER: Uses Tracker cache to prevent 429s
+// Server-side cache so we don't hammer Mist
+let assetCache = {
+  data: [],
+  lastFetch: 0,
+  isRateLimited: false,
+  backoffUntil: 0,
+};
+const CACHE_TTL_MS = 60 * 1000; // 1 minute
+
 const fetchAssetLocations = async () => {
+  const now = Date.now();
+
+  // 1. If we have fresh cache, return it immediately
+  if (assetCache.data.length > 0 && now - assetCache.lastFetch < CACHE_TTL_MS) {
+    return assetCache.data;
+  }
+
+  // 2. If we are in a backoff period due to a previous 429, return stale cache
+  if (assetCache.isRateLimited && now < assetCache.backoffUntil) {
+    if (assetCache.data.length > 0) return assetCache.data;
+    throw new Error("Mist API rate-limited. Please wait a few minutes.");
+  }
+
   try {
-    // 1. Try to get from background tracker cache
-    let assets = AssetTracker.getCachedAssets();
-    if (assets && assets.length > 0) {
-      return assets;
-    }
-
-    // 2. Cache empty? Tell tracker to do a safe fetch (has built-in backoff)
-    console.log("⚠️ Asset cache empty, asking tracker to fetch safely...");
-    assets = await AssetTracker.getAssets();
-    if (assets && assets.length > 0) {
-      return assets;
-    }
-
-    // 3. If tracker returns empty, hit Mist API directly as a last resort
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
     const response = await axios.get(url, {
       headers: getMistHeaders(),
@@ -109,7 +117,7 @@ const fetchAssetLocations = async () => {
     });
     const rawAssets = response.data;
 
-    // Group them so the rest of the controller doesn't break
+    // Group and process
     const assetGroups = new Map();
     for (const a of rawAssets) {
       if (!a.mac) continue;
@@ -135,15 +143,26 @@ const fetchAssetLocations = async () => {
         beam: primary.beam,
       });
     }
+
+    // Update cache on success
+    assetCache.data = processed;
+    assetCache.lastFetch = now;
+    assetCache.isRateLimited = false;
+    assetCache.backoffUntil = 0;
     return processed;
   } catch (error) {
-    console.error("❌ Mist Fetch Error:", error.message);
-    // If it's a 429, try to just return whatever is in the cache (even if empty)
-    return AssetTracker.getCachedAssets() || [];
+    if (error.response && error.response.status === 429) {
+      console.warn("⚠️ Hit 429 Rate Limit. Backing off for 5 minutes.");
+      assetCache.isRateLimited = true;
+      assetCache.backoffUntil = now + 5 * 60 * 1000; // 5 minute backoff
+
+      if (assetCache.data.length > 0) return assetCache.data; // Return stale cache
+      throw new Error("Mist API rate-limited. Please wait a few minutes.");
+    }
+    throw error;
   }
 };
 
-// Fetch live AP coordinates directly from Mist API (cached by Mist for 60s)
 const fetchMistAPs = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/maps/${mapId}/discovered_aps`;
@@ -244,24 +263,13 @@ exports.getVisitorRoute = async (req, res) => {
         .status(404)
         .json({ success: false, message: "No ID assigned" });
 
-    // 1. Fetch safely
-    const assets = await fetchAssetLocations();
-    const assetNames = assets
-      .map((a) => a.mac || a.device_name)
-      .filter(Boolean);
-
-    if (assetNames.length === 0) {
-      return res.status(429).json({
-        success: false,
-        message: "Rate limited by Mist API. Please wait a few minutes.",
-        error: "No assets available in cache and Mist API returned 429.",
-      });
+    // 1. Fetch (Now cached)
+    let assets = [];
+    try {
+      assets = await fetchAssetLocations();
+    } catch (error) {
+      return res.status(429).json({ success: false, message: error.message });
     }
-
-    console.log(
-      "📋 Available Assets (Cached from Mist):",
-      assetNames.join(", "),
-    );
 
     const targetMac = (visitor.tagMac || visitor.mistMacAddress || "")
       .toLowerCase()
@@ -291,11 +299,13 @@ exports.getVisitorRoute = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: `Asset "${visitor.tagMac || visitor.idNumber}" not found in Mist system`,
-        available_assets: assetNames,
+        available_assets: assets
+          .map((a) => a.mac || a.device_name)
+          .filter(Boolean),
       });
     }
 
-    // 2. Fetch live APs
+    // 2. Fetch APs
     const currentMapId =
       matchedAsset.map_id || "30141417-44ea-4982-993c-6225c9f08315";
     const cfg =
