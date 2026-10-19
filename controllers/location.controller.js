@@ -83,7 +83,7 @@ const BEAM_ANGLES = {
 };
 
 // ============================
-// LOAD AP DATA (For Centroid Calc)
+// LOAD AP DATA (For direct anchoring)
 // ============================
 const AP_MAP = new Map();
 try {
@@ -192,7 +192,7 @@ async function resolveVisitorId(idOrCurrent, req) {
 }
 
 // ============================
-// GET VISITOR LOCATION (Centroid Math)
+// GET VISITOR LOCATION (Direct AP Anchor)
 // ============================
 
 exports.getVisitorRoute = async (req, res) => {
@@ -245,24 +245,20 @@ exports.getVisitorRoute = async (req, res) => {
       });
     }
 
-    // ---------- CENTROID CALCULATION ----------
+    // ---------- DIRECT AP ANCHOR CALCULATION ----------
     const currentMapId =
       matchedAsset.map_id || "30141417-44ea-4982-993c-6225c9f08315";
     const cfg = MAP_CONFIGS[currentMapId];
     const ppm = cfg?.ppm || 50.07391564392213;
 
-    let sumX = 0,
-      sumY = 0,
-      sumW = 0;
+    let assetX = null;
+    let assetY = null;
     let primaryDetection = null;
 
+    // The tracker sorts detections by strongest RSSI, so we just loop
+    // until we find the strongest one that actually has map coordinates.
     for (const det of matchedAsset.detections || []) {
-      if (
-        det.ap_mac &&
-        (primaryDetection === null || det.rssi > primaryDetection.rssi)
-      ) {
-        primaryDetection = det;
-      }
+      if (!primaryDetection) primaryDetection = det; // Keep highest RSSI for telemetry
 
       const apInfo = AP_MAP.get((det.ap_mac || "").toLowerCase().trim());
       if (!apInfo) continue;
@@ -282,38 +278,17 @@ exports.getVisitorRoute = async (req, res) => {
       }
 
       if (apX !== null && apY !== null) {
-        const weight = Math.max(1, (det.rssi ?? -100) + 100); // RSSI Weighting
-        sumX += apX * weight;
-        sumY += apY * weight;
-        sumW += weight;
-      }
-    }
-
-    let assetX = null,
-      assetY = null;
-
-    if (sumW > 0) {
-      assetX = sumX / sumW;
-      assetY = sumY / sumW;
-    } else {
-      // Fallback to primary AP if no coordinates matched
-      const primaryAp = AP_MAP.get(
-        (primaryDetection?.ap_mac || "").toLowerCase().trim(),
-      );
-      if (primaryAp) {
-        assetX = Number.isFinite(primaryAp.x)
-          ? primaryAp.x
-          : primaryAp.x_m * ppm + cfg.origin_x;
-        assetY = Number.isFinite(primaryAp.y)
-          ? primaryAp.y
-          : cfg.origin_y - primaryAp.y_m * ppm;
+        // Use this AP's exact coordinates and stop looping
+        assetX = apX;
+        assetY = apY;
+        break;
       }
     }
 
     if (assetX === null || assetY === null) {
       return res.status(404).json({
         success: false,
-        message: `Asset "${matchedAsset.mac}" has no location data`,
+        message: `Asset "${matchedAsset.mac}" has no location data (AP coords missing)`,
       });
     }
 
@@ -351,7 +326,6 @@ exports.getVisitorRoute = async (req, res) => {
           qrExpiresAt: visitor.qrExpiresAt,
         },
         location: {
-          // FIX: Send the computed centroid as x and y
           x: assetX,
           y: assetY,
           mac: matchedAsset.mac,
@@ -366,7 +340,6 @@ exports.getVisitorRoute = async (req, res) => {
           device_name: matchedAsset.device_name,
           pixel_coordinates: { x: assetX, y: assetY },
           world_coordinates: worldCoords,
-          // REMOVED: smoothed_position and used_smoothed
         },
         map: mapDetails
           ? {
@@ -631,3 +604,4 @@ module.exports = {
   getAssetTrackingState: exports.getAssetTrackingState,
   resetAssetTracking: exports.resetAssetTracking,
 };
+c;
