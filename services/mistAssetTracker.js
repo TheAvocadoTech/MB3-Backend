@@ -1,10 +1,15 @@
 // services/mistAssetTracker.js
-// RAW PASS-THROUGH MODE — no calculations, no filters, no smoothing, no trail, no corrections.
+// RAW SIGNAL MODE — no filters, no smoothing, no trail, no corrections.
+// Position is AP-anchored: the strongest-detection AP's own coordinates are
+// used as the tag position. No centroid, no weighting, no outlier rejection.
 //
 // Pipeline:
 //   1. Fetch /sites/{site}/stats/assets from Mist
 //   2. Group detections by asset MAC
-//   3. Return { mac, device_name, map_id, detections, ap_mac, rssi, beam, ppm }
+//   3. Pick strongest detection as primary AP
+//   4. Position = primary AP's coordinates (meters + pixels)
+//   5. Return { mac, device_name, map_id, position, position_px, detections,
+//               ap_mac, ap_name, rssi, beam, ppm }
 //
 // Nothing else. If a value is missing, it is not invented.
 
@@ -73,7 +78,7 @@ const MAP_CONFIGS = {
 };
 
 // ============================================================
-// AssetTracker (raw pass-through mode)
+// AssetTracker (raw AP-anchored mode)
 // ============================================================
 class AssetTracker extends EventEmitter {
   constructor() {
@@ -86,14 +91,14 @@ class AssetTracker extends EventEmitter {
     // Last successful response — served on 429 / network failure
     this.cachedProcessedAssets = [];
 
-    // AP dictionary loaded from ap_list.json (raw metadata only)
+    // AP dictionary loaded from ap_list.json
     this.apMap = new Map();
 
     this._loadStaticAPs();
   }
 
   // ------------------------------------------------------------
-  // Load AP list — raw metadata only, no coordinate derivation
+  // Load AP list — keep raw pixel + meter coords, derive neither
   // ------------------------------------------------------------
   _loadStaticAPs() {
     try {
@@ -130,14 +135,14 @@ class AssetTracker extends EventEmitter {
   }
 
   // ------------------------------------------------------------
-  // Public: cached assets (raw list from last successful poll)
+  // Public: cached assets
   // ------------------------------------------------------------
   getCachedAssets() {
     return this.cachedProcessedAssets;
   }
 
   // ------------------------------------------------------------
-  // Public: fetch from Mist and return raw grouped assets
+  // Public: fetch from Mist and return grouped assets
   // ------------------------------------------------------------
   async getAssets() {
     const now = Date.now();
@@ -174,13 +179,15 @@ class AssetTracker extends EventEmitter {
   }
 
   // ------------------------------------------------------------
-  // Public: legacy stubs so old callers don't crash
+  // Legacy stubs so old callers don't crash
   // ------------------------------------------------------------
   getAssetStates() {
     const states = {};
     for (const asset of this.cachedProcessedAssets) {
       states[asset.mac] = {
         device_name: asset.device_name,
+        position: asset.position,
+        position_px: asset.position_px,
         map_id: asset.map_id,
         ap_mac: asset.ap_mac,
         rssi: asset.rssi,
@@ -198,7 +205,7 @@ class AssetTracker extends EventEmitter {
   setWayfindingData() {}
 
   // ------------------------------------------------------------
-  // Raw grouping — no centroid, no weights, no coordinate math
+  // Group by asset MAC, pick strongest detection, anchor to AP
   // ------------------------------------------------------------
   _processAssetData(assets) {
     const processedAssets = [];
@@ -227,14 +234,47 @@ class AssetTracker extends EventEmitter {
         }
 
         const cfg = MAP_CONFIGS[firstDet.map_id];
+        const primaryAp = this.apMap.get(primaryDet.ap_mac);
+
+        // ----------------------------------------------
+        // AP-anchored position — no centroid, no weights
+        // ----------------------------------------------
+        let position = null;
+        let position_px = null;
+
+        if (primaryAp && cfg) {
+          if (Number.isFinite(primaryAp.x) && Number.isFinite(primaryAp.y)) {
+            position_px = { x: primaryAp.x, y: primaryAp.y };
+            position = {
+              x_m: (primaryAp.x - cfg.origin_x) / cfg.ppm,
+              y_m: (cfg.origin_y - primaryAp.y) / cfg.ppm,
+              ppm: cfg.ppm,
+            };
+          } else if (
+            Number.isFinite(primaryAp.x_m) &&
+            Number.isFinite(primaryAp.y_m)
+          ) {
+            position = {
+              x_m: primaryAp.x_m,
+              y_m: primaryAp.y_m,
+              ppm: cfg.ppm,
+            };
+            position_px = {
+              x: primaryAp.x_m * cfg.ppm + cfg.origin_x,
+              y: cfg.origin_y - primaryAp.y_m * cfg.ppm,
+            };
+          }
+        }
 
         processedAssets.push({
           mac,
           device_name: firstDet.device_name || "Unknown",
           map_id: firstDet.map_id,
+          position,
+          position_px,
           detections,
           ap_mac: primaryDet.ap_mac,
-          ap_name: this.apMap.get(primaryDet.ap_mac)?.name || primaryDet.ap_mac,
+          ap_name: primaryAp?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
           beam: primaryDet.beam ?? null,
           ppm: cfg?.ppm ?? null,
