@@ -2,8 +2,6 @@
 const QRModel = require("../models/User/IdVisitorQR.model");
 const axios = require("axios");
 const mongoose = require("mongoose");
-const path = require("path");
-const fs = require("fs");
 
 // ============================
 // MIST API CONFIGURATION
@@ -93,20 +91,27 @@ let assetCache = {
   isRateLimited: false,
   backoffUntil: 0,
 };
-const CACHE_TTL_MS = 60 * 1000; // 1 minute
+
+// INCREASED TO 5 MINUTES to prevent 429s
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
 const fetchAssetLocations = async () => {
   const now = Date.now();
 
-  // 1. If we have fresh cache, return it immediately
+  // 1. Fast Path: Return fresh cache
   if (assetCache.data.length > 0 && now - assetCache.lastFetch < CACHE_TTL_MS) {
     return assetCache.data;
   }
 
-  // 2. If we are in a backoff period due to a previous 429, return stale cache
+  // 2. Backoff Path: If blocked, return stale cache if we have it
   if (assetCache.isRateLimited && now < assetCache.backoffUntil) {
     if (assetCache.data.length > 0) return assetCache.data;
-    throw new Error("Mist API rate-limited. Please wait a few minutes.");
+
+    // If cache is empty AND we are blocked, return empty so server doesn't crash
+    console.warn(
+      "⚠️ Blocked by Mist and no cache available. Serving empty state.",
+    );
+    return [];
   }
 
   try {
@@ -154,10 +159,12 @@ const fetchAssetLocations = async () => {
     if (error.response && error.response.status === 429) {
       console.warn("⚠️ Hit 429 Rate Limit. Backing off for 5 minutes.");
       assetCache.isRateLimited = true;
-      assetCache.backoffUntil = now + 5 * 60 * 1000; // 5 minute backoff
+      assetCache.backoffUntil = now + 5 * 60 * 1000;
 
-      if (assetCache.data.length > 0) return assetCache.data; // Return stale cache
-      throw new Error("Mist API rate-limited. Please wait a few minutes.");
+      if (assetCache.data.length > 0) return assetCache.data;
+
+      // Don't throw an error, just return empty so the frontend stays alive
+      return [];
     }
     throw error;
   }
@@ -176,10 +183,7 @@ const fetchMistAPs = async (mapId) => {
     }
     return apMap;
   } catch (error) {
-    console.warn(
-      `⚠️ Failed to fetch live APs from Mist (using fallback):`,
-      error.message,
-    );
+    console.warn(`⚠️ Failed to fetch live APs from Mist:`, error.message);
     return new Map();
   }
 };
@@ -269,6 +273,15 @@ exports.getVisitorRoute = async (req, res) => {
       assets = await fetchAssetLocations();
     } catch (error) {
       return res.status(429).json({ success: false, message: error.message });
+    }
+
+    // If assets is empty because we are blocked, tell the frontend
+    if (assets.length === 0) {
+      return res.status(503).json({
+        success: false,
+        message:
+          "Mist API is currently rate-limiting this server. Waiting for cooldown. Please try again in 5 minutes.",
+      });
     }
 
     const targetMac = (visitor.tagMac || visitor.mistMacAddress || "")
