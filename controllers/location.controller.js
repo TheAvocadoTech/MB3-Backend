@@ -2,6 +2,7 @@
 const QRModel = require("../models/User/IdVisitorQR.model");
 const axios = require("axios");
 const mongoose = require("mongoose");
+const AssetTracker = require("../services/mistAssetTracker");
 
 // ============================
 // MIST API CONFIGURATION
@@ -84,53 +85,82 @@ const getMistHeaders = () => ({
   "Content-Type": "application/json",
 });
 
-// Fetch assets DIRECTLY from Mist API (No Cache)
+// SAFE FETCHER: Uses Tracker cache to prevent 429s
 const fetchAssetLocations = async () => {
-  const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
-  const response = await axios.get(url, { headers: getMistHeaders() });
-  const rawAssets = response.data;
-
-  // Group detections by MAC manually
-  const assetGroups = new Map();
-  for (const a of rawAssets) {
-    if (!a.mac) continue;
-    let group = assetGroups.get(a.mac);
-    if (!group) {
-      group = [];
-      assetGroups.set(a.mac, group);
+  try {
+    // 1. Try to get from background tracker cache
+    let assets = AssetTracker.getCachedAssets();
+    if (assets && assets.length > 0) {
+      return assets;
     }
-    group.push(a);
-  }
 
-  const processed = [];
-  for (const [mac, detections] of assetGroups) {
-    detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
-    const primary = detections[0];
-    processed.push({
-      mac: mac,
-      device_name: primary.name || primary.device_name || "Unknown",
-      map_id: primary.map_id,
-      detections: detections,
-      ap_mac: primary.ap_mac,
-      rssi: primary.rssi,
-      beam: primary.beam,
+    // 2. Cache empty? Tell tracker to do a safe fetch (has built-in backoff)
+    console.log("⚠️ Asset cache empty, asking tracker to fetch safely...");
+    assets = await AssetTracker.getAssets();
+    if (assets && assets.length > 0) {
+      return assets;
+    }
+
+    // 3. If tracker returns empty, hit Mist API directly as a last resort
+    const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/assets`;
+    const response = await axios.get(url, {
+      headers: getMistHeaders(),
+      timeout: 5000,
     });
+    const rawAssets = response.data;
+
+    // Group them so the rest of the controller doesn't break
+    const assetGroups = new Map();
+    for (const a of rawAssets) {
+      if (!a.mac) continue;
+      let group = assetGroups.get(a.mac);
+      if (!group) {
+        group = [];
+        assetGroups.set(a.mac, group);
+      }
+      group.push(a);
+    }
+
+    const processed = [];
+    for (const [mac, detections] of assetGroups) {
+      detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
+      const primary = detections[0];
+      processed.push({
+        mac: mac,
+        device_name: primary.name || primary.device_name || "Unknown",
+        map_id: primary.map_id,
+        detections: detections,
+        ap_mac: primary.ap_mac,
+        rssi: primary.rssi,
+        beam: primary.beam,
+      });
+    }
+    return processed;
+  } catch (error) {
+    console.error("❌ Mist Fetch Error:", error.message);
+    // If it's a 429, try to just return whatever is in the cache (even if empty)
+    return AssetTracker.getCachedAssets() || [];
   }
-  return processed;
 };
 
-// Fetch live AP coordinates DIRECTLY from Mist API
+// Fetch live AP coordinates directly from Mist API (cached by Mist for 60s)
 const fetchMistAPs = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/stats/maps/${mapId}/discovered_aps`;
-    const response = await axios.get(url, { headers: getMistHeaders() });
+    const response = await axios.get(url, {
+      headers: getMistHeaders(),
+      timeout: 5000,
+    });
     const apMap = new Map();
     for (const ap of response.data) {
       if (ap.mac) apMap.set(ap.mac.toLowerCase().trim(), ap);
     }
     return apMap;
   } catch (error) {
-    console.error(`❌ Failed to fetch APs from Mist:`, error.message);
+    console.warn(
+      `⚠️ Failed to fetch live APs from Mist (using fallback):`,
+      error.message,
+    );
     return new Map();
   }
 };
@@ -138,7 +168,10 @@ const fetchMistAPs = async (mapId) => {
 const fetchMapDetails = async (mapId) => {
   try {
     const url = `${MIST_API_BASE}/sites/${MIST_SITE_ID}/maps/${mapId}`;
-    const response = await axios.get(url, { headers: getMistHeaders() });
+    const response = await axios.get(url, {
+      headers: getMistHeaders(),
+      timeout: 5000,
+    });
     return response.data;
   } catch (error) {
     console.error("❌ Map API Error:", error.message);
@@ -185,7 +218,7 @@ async function resolveVisitorId(idOrCurrent, req) {
 }
 
 // ============================
-// GET VISITOR LOCATION (Direct from Mist)
+// GET VISITOR LOCATION
 // ============================
 
 exports.getVisitorRoute = async (req, res) => {
@@ -211,12 +244,24 @@ exports.getVisitorRoute = async (req, res) => {
         .status(404)
         .json({ success: false, message: "No ID assigned" });
 
-    // 1. Fetch directly from Mist
+    // 1. Fetch safely
     const assets = await fetchAssetLocations();
     const assetNames = assets
       .map((a) => a.mac || a.device_name)
       .filter(Boolean);
-    console.log("📋 Available Assets (Live from Mist):", assetNames.join(", "));
+
+    if (assetNames.length === 0) {
+      return res.status(429).json({
+        success: false,
+        message: "Rate limited by Mist API. Please wait a few minutes.",
+        error: "No assets available in cache and Mist API returned 429.",
+      });
+    }
+
+    console.log(
+      "📋 Available Assets (Cached from Mist):",
+      assetNames.join(", "),
+    );
 
     const targetMac = (visitor.tagMac || visitor.mistMacAddress || "")
       .toLowerCase()
@@ -250,7 +295,7 @@ exports.getVisitorRoute = async (req, res) => {
       });
     }
 
-    // 2. Fetch live APs from Mist for this map
+    // 2. Fetch live APs
     const currentMapId =
       matchedAsset.map_id || "30141417-44ea-4982-993c-6225c9f08315";
     const cfg =
@@ -274,7 +319,6 @@ exports.getVisitorRoute = async (req, res) => {
         primaryDetection = det;
       }
 
-      // Look up the AP from the Mist API data
       const apInfo = mistAPs.get((det.ap_mac || "").toLowerCase().trim());
       if (!apInfo) continue;
 
@@ -307,7 +351,6 @@ exports.getVisitorRoute = async (req, res) => {
       assetX = sumX / sumW;
       assetY = sumY / sumW;
     } else {
-      // Fallback: Use primary AP location if centroid fails
       const primaryAp = mistAPs.get(
         (primaryDetection?.ap_mac || "").toLowerCase().trim(),
       );
@@ -590,7 +633,6 @@ exports.getAssetTrackingState = async (req, res) => {
 };
 exports.resetAssetTracking = async (req, res) => {
   try {
-    const { mac } = req.params;
     res.status(200).json({ success: true, message: `Reset requested` });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
