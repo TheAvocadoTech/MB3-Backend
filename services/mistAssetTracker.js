@@ -1,11 +1,12 @@
 // services/mistAssetTracker.js
 // RAW DATA MODE — zero coordinate calculations.
-// Just groups detections by MAC and passes them to the controller.
+// Redis-backed caching to prevent API hammering and server crashes.
 
 const axios = require("axios");
 const EventEmitter = require("events");
 const fs = require("fs");
 const path = require("path");
+const Redis = require("ioredis");
 
 const SITE_ID = process.env.MIST_SITE_ID;
 if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
@@ -13,23 +14,48 @@ if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
 const API_TOKEN = process.env.MIST_API_TOKEN;
 if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
 
+// Radius (in meters) that will be attached to each asset payload.
+// Purely descriptive — no math done here.
+const ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
+
+// Redis config
+const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
+const CACHE_KEY = `mist:assets:${SITE_ID}`;
+const BACKOFF_KEY = `mist:backoff:${SITE_ID}`;
+const CACHE_TTL_SEC = parseInt(process.env.MIST_CACHE_TTL_SEC, 10) || 30;
+const MIN_REFRESH_MS = parseInt(process.env.MIST_MIN_REFRESH_MS, 10) || 5000;
+
 const mist = axios.create({
   baseURL: "https://api.mist.com/api/v1",
   headers: {
     Authorization: `Token ${API_TOKEN}`,
     "Content-Type": "application/json",
   },
+  timeout: 10000,
 });
 
 class AssetTracker extends EventEmitter {
   constructor() {
     super();
-    this.backoffUntil = 0;
-    this.backoffMultiplier = 1;
     this.cachedProcessedAssets = [];
     this.apMap = new Map();
+    this.lastFetchAt = 0;
+    this.inflight = null;
+
+    this.redis = new Redis(REDIS_URL, {
+      maxRetriesPerRequest: 3,
+      enableOfflineQueue: false,
+      lazyConnect: false,
+      retryStrategy: (times) => Math.min(times * 200, 3000),
+    });
+
+    this.redis.on("error", (err) => console.error("Redis error:", err.message));
+    this.redis.on("connect", () =>
+      console.log("✅ Redis connected for Mist asset cache"),
+    );
 
     this._loadStaticAPs();
+    this._hydrateFromRedis();
   }
 
   _loadStaticAPs() {
@@ -43,7 +69,6 @@ class AssetTracker extends EventEmitter {
 
       for (const ap of apList) {
         if (!ap.mac) continue;
-        // Store raw AP data. No coordinate derivation.
         this.apMap.set(ap.mac.toLowerCase().trim(), {
           name: ap.name || ap.mac,
           map_id: ap.map_id || null,
@@ -58,36 +83,100 @@ class AssetTracker extends EventEmitter {
     }
   }
 
+  async _hydrateFromRedis() {
+    try {
+      const cached = await this.redis.get(CACHE_KEY);
+      if (cached) {
+        this.cachedProcessedAssets = JSON.parse(cached);
+        console.log(
+          `♻️ Hydrated ${this.cachedProcessedAssets.length} assets from Redis`,
+        );
+        this.emit("assets", this.cachedProcessedAssets);
+      }
+    } catch (err) {
+      console.warn("⚠️ Redis hydrate failed:", err.message);
+    }
+  }
+
   getCachedAssets() {
     return this.cachedProcessedAssets;
   }
 
+  async _isBackedOff() {
+    try {
+      const until = await this.redis.get(BACKOFF_KEY);
+      if (!until) return false;
+      return parseInt(until, 10) > Date.now();
+    } catch {
+      return false;
+    }
+  }
+
+  async _setBackoff(waitMs) {
+    try {
+      await this.redis.set(
+        BACKOFF_KEY,
+        String(Date.now() + waitMs),
+        "PX",
+        waitMs + 5000,
+      );
+    } catch (err) {
+      console.warn("⚠️ Could not set Redis backoff:", err.message);
+    }
+  }
+
   async getAssets() {
-    if (this.backoffUntil > Date.now()) {
+    // Return cached value immediately if within min refresh window.
+    if (Date.now() - this.lastFetchAt < MIN_REFRESH_MS) {
       return this.cachedProcessedAssets;
     }
 
+    if (await this._isBackedOff()) {
+      return this.cachedProcessedAssets;
+    }
+
+    // Dedupe concurrent requests.
+    if (this.inflight) return this.inflight;
+
+    this.inflight = this._fetchAndCache().finally(() => {
+      this.inflight = null;
+    });
+    return this.inflight;
+  }
+
+  async _fetchAndCache() {
     try {
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
-      this.backoffMultiplier = 1;
-      this.backoffUntil = 0;
+      this.lastFetchAt = Date.now();
 
       if (Array.isArray(response.data) && response.data.length > 0) {
         const processed = this._processAssetData(response.data);
         this.cachedProcessedAssets = processed;
+
+        // Persist to Redis (fire-and-forget).
+        this.redis
+          .set(CACHE_KEY, JSON.stringify(processed), "EX", CACHE_TTL_SEC)
+          .catch((err) => console.warn("⚠️ Redis set failed:", err.message));
+
+        this.emit("assets", processed);
         return processed;
       }
       return this.cachedProcessedAssets;
     } catch (err) {
-      if (err.response?.status === 429) {
+      const status = err.response?.status;
+
+      if (status === 429) {
         const retryAfter =
           parseInt(err.response.headers["retry-after"], 10) || 60;
-        const waitMs = retryAfter * 1000 * this.backoffMultiplier;
-        this.backoffUntil = Date.now() + waitMs;
-        this.backoffMultiplier = Math.min(this.backoffMultiplier * 2, 8);
-        this.emit("rateLimited", { retryAfter: Math.ceil(waitMs / 1000) });
+        const waitMs = retryAfter * 1000;
+        await this._setBackoff(waitMs);
+        this.emit("rateLimited", { retryAfter });
+        console.warn(
+          `⏸️ Mist 429 — backing off ${retryAfter}s (Redis-persisted)`,
+        );
         return this.cachedProcessedAssets;
       }
+
       console.error("Mist API Error:", err.message);
       return this.cachedProcessedAssets;
     }
@@ -112,7 +201,6 @@ class AssetTracker extends EventEmitter {
         const firstDet = detections[0];
         if (!firstDet.map_id) continue;
 
-        // Sort detections by strongest RSSI first
         detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
         const primaryDet = detections[0];
 
@@ -120,13 +208,14 @@ class AssetTracker extends EventEmitter {
           mac,
           device_name: firstDet.device_name || "Unknown",
           map_id: firstDet.map_id,
-          detections, // Pass raw detections
+          detections, // raw detections passed through
           ap_mac: primaryDet.ap_mac,
           ap_name:
             this.apMap.get((primaryDet.ap_mac || "").toLowerCase().trim())
               ?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
           beam: primaryDet.beam ?? null,
+          radius: ASSET_RADIUS_M, // radius in meters — descriptive only
         });
       } catch (err) {
         console.error(`Error processing asset ${mac}:`, err);
@@ -134,6 +223,10 @@ class AssetTracker extends EventEmitter {
     }
 
     return processedAssets;
+  }
+
+  async close() {
+    await this.redis.quit().catch(() => {});
   }
 }
 
