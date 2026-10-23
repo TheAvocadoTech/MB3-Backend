@@ -16,6 +16,7 @@ if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
 
 // Fallback radius if Mist doesn't provide one
 const DEFAULT_ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
+const STALE_THRESHOLD_MS = 120_000; // 2 minutes (120 seconds)
 
 // Redis config
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -33,11 +34,24 @@ const mist = axios.create({
   timeout: 10000,
 });
 
+// Safe JSON stringifier to prevent Redis writes from crashing on NaN/BigInt
+const safeJson = (obj) => {
+  try {
+    return JSON.stringify(obj, (k, v) =>
+      typeof v === "bigint" ? v.toString() : Number.isNaN(v) ? null : v,
+    );
+  } catch (err) {
+    console.warn("⚠️ JSON serialize failed:", err.message);
+    return null;
+  }
+};
+
 class AssetTracker extends EventEmitter {
   constructor() {
     super();
     this.cachedProcessedAssets = [];
     this.apMap = new Map();
+    this.mapMap = new Map(); // For resolving map_id to map_name
     this.lastFetchAt = 0;
     this.inflight = null;
 
@@ -76,6 +90,11 @@ class AssetTracker extends EventEmitter {
           x_m: ap.x_m,
           y_m: ap.y_m,
         });
+
+        // Map map_id to map_name if available in the AP list
+        if (ap.map_id && ap.map_name) {
+          this.mapMap.set(ap.map_id, ap.map_name);
+        }
       }
     } catch (err) {
       console.warn("⚠️ Could not load ap_list.json:", err.message);
@@ -146,16 +165,19 @@ class AssetTracker extends EventEmitter {
   async _fetchAndCache() {
     try {
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
-      this.lastFetchAt = Date.now();
 
       if (Array.isArray(response.data) && response.data.length > 0) {
         const processed = this._processAssetData(response.data);
         this.cachedProcessedAssets = processed;
+        this.lastFetchAt = Date.now(); // Moved here to prevent lockout on processing failure
 
         // Persist to Redis (fire-and-forget).
-        this.redis
-          .set(CACHE_KEY, JSON.stringify(processed), "EX", CACHE_TTL_SEC)
-          .catch((err) => console.warn("⚠️ Redis set failed:", err.message));
+        const json = safeJson(processed);
+        if (json) {
+          this.redis
+            .set(CACHE_KEY, json, "EX", CACHE_TTL_SEC)
+            .catch((err) => console.warn("⚠️ Redis set failed:", err.message));
+        }
 
         this.emit("assets", processed);
         return processed;
@@ -203,12 +225,28 @@ class AssetTracker extends EventEmitter {
           continue;
         }
 
-        // Sort by RSSI to find the strongest detection
-        detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
-        const primaryDet = detections[0];
+        // Clone before sorting to prevent mutating the raw axios response
+        const sortedDetections = [...detections].sort(
+          (a, b) => (b.rssi ?? -999) - (a.rssi ?? -999),
+        );
+        const primaryDet = sortedDetections[0];
+
+        // Slim down detections for the payload to save Redis memory
+        const slimDetections = sortedDetections.map((d) => ({
+          ap_mac: d.ap_mac,
+          ap_name:
+            this.apMap.get((d.ap_mac || "").toLowerCase().trim())?.name ||
+            d.ap_mac,
+          rssi: d.rssi ?? null,
+          beam: d.beam ?? null,
+          map_id: d.map_id ?? null,
+          x: d.x ?? null,
+          y: d.y ?? null,
+          last_seen: d.last_seen ?? null,
+        }));
 
         // Determine location confidence based on how many APs heard the tag
-        const detectionsCount = detections.length;
+        const detectionsCount = slimDetections.length;
         let locationConfidence = "Low (Single AP)";
         if (detectionsCount >= 3) {
           locationConfidence = "High (Triangulated)";
@@ -221,11 +259,18 @@ class AssetTracker extends EventEmitter {
           (primaryDet.ap_mac || "").toLowerCase().trim(),
         );
 
+        // Freshness calculation (Mist sends timestamp in SECONDS)
+        const lastSeenSec =
+          primaryDet.last_seen ?? primaryDet.timestamp ?? null;
+        const lastSeenMs = lastSeenSec ? lastSeenSec * 1000 : null;
+        const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
+        const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
+
         processedAssets.push({
           mac,
           device_name: firstDet.device_name || "Unknown",
           map_id: firstDet.map_id,
-          detections, // raw detections passed through
+          map_name: this.mapMap.get(firstDet.map_id) || null,
 
           // Location Data
           x: primaryDet.x ?? apInfo?.x ?? null,
@@ -257,9 +302,14 @@ class AssetTracker extends EventEmitter {
           eddystone_namespace: firstDet.eddystone_namespace ?? null,
           eddystone_instance: firstDet.eddystone_instance ?? null,
 
-          // Freshness
-          last_seen: primaryDet.last_seen ?? primaryDet.timestamp ?? null,
+          // Freshness Tracking
+          last_seen: lastSeenMs, // Converted to milliseconds for easy JS Date usage
+          age_ms: ageMs,
+          is_stale: isStale,
           updated_at: new Date().toISOString(),
+
+          // Slimmed Detections
+          detections: slimDetections,
         });
       } catch (err) {
         console.error(`Error processing asset ${mac}:`, err);
