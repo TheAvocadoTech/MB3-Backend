@@ -1,7 +1,4 @@
 // services/mistAssetTracker.js
-// RAW DATA MODE — zero coordinate calculations.
-// Redis-backed caching to prevent API hammering and server crashes.
-
 const axios = require("axios");
 const EventEmitter = require("events");
 const fs = require("fs");
@@ -14,11 +11,9 @@ if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
 const API_TOKEN = process.env.MIST_API_TOKEN;
 if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
 
-// Radius (in meters) that will be attached to each asset payload.
-// Purely descriptive — no math done here.
-const ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
+const DEFAULT_ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
+const STALE_THRESHOLD_MS = 120_000; // 2 minutes
 
-// Redis config
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const CACHE_KEY = `mist:assets:${SITE_ID}`;
 const BACKOFF_KEY = `mist:backoff:${SITE_ID}`;
@@ -34,11 +29,23 @@ const mist = axios.create({
   timeout: 10000,
 });
 
+const safeJson = (obj) => {
+  try {
+    return JSON.stringify(obj, (k, v) =>
+      typeof v === "bigint" ? v.toString() : Number.isNaN(v) ? null : v,
+    );
+  } catch (err) {
+    console.warn("⚠️ JSON serialize failed:", err.message);
+    return null;
+  }
+};
+
 class AssetTracker extends EventEmitter {
   constructor() {
     super();
     this.cachedProcessedAssets = [];
     this.apMap = new Map();
+    this.mapMap = new Map();
     this.lastFetchAt = 0;
     this.inflight = null;
 
@@ -77,6 +84,10 @@ class AssetTracker extends EventEmitter {
           x_m: ap.x_m,
           y_m: ap.y_m,
         });
+
+        if (ap.map_id && ap.map_name) {
+          this.mapMap.set(ap.map_id, ap.map_name);
+        }
       }
     } catch (err) {
       console.warn("⚠️ Could not load ap_list.json:", err.message);
@@ -131,11 +142,11 @@ class AssetTracker extends EventEmitter {
       return this.cachedProcessedAssets;
     }
 
+    // If Mist rate-limited us, don't even try to fetch
     if (await this._isBackedOff()) {
       return this.cachedProcessedAssets;
     }
 
-    // Dedupe concurrent requests.
     if (this.inflight) return this.inflight;
 
     this.inflight = this._fetchAndCache().finally(() => {
@@ -147,16 +158,18 @@ class AssetTracker extends EventEmitter {
   async _fetchAndCache() {
     try {
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
-      this.lastFetchAt = Date.now();
 
       if (Array.isArray(response.data) && response.data.length > 0) {
         const processed = this._processAssetData(response.data);
         this.cachedProcessedAssets = processed;
+        this.lastFetchAt = Date.now();
 
-        // Persist to Redis (fire-and-forget).
-        this.redis
-          .set(CACHE_KEY, JSON.stringify(processed), "EX", CACHE_TTL_SEC)
-          .catch((err) => console.warn("⚠️ Redis set failed:", err.message));
+        const json = safeJson(processed);
+        if (json) {
+          this.redis
+            .set(CACHE_KEY, json, "EX", CACHE_TTL_SEC)
+            .catch((err) => console.warn("⚠️ Redis set failed:", err.message));
+        }
 
         this.emit("assets", processed);
         return processed;
@@ -166,14 +179,13 @@ class AssetTracker extends EventEmitter {
       const status = err.response?.status;
 
       if (status === 429) {
+        // Mist rate limit hit
         const retryAfter =
           parseInt(err.response.headers["retry-after"], 10) || 60;
         const waitMs = retryAfter * 1000;
         await this._setBackoff(waitMs);
         this.emit("rateLimited", { retryAfter });
-        console.warn(
-          `⏸️ Mist 429 — backing off ${retryAfter}s (Redis-persisted)`,
-        );
+        console.warn(`⏸️ Mist 429 — backing off ${retryAfter}s`);
         return this.cachedProcessedAssets;
       }
 
@@ -199,23 +211,86 @@ class AssetTracker extends EventEmitter {
     for (const [mac, detections] of assetGroups) {
       try {
         const firstDet = detections[0];
-        if (!firstDet.map_id) continue;
+        if (!firstDet.map_id) {
+          console.warn(`Asset ${mac} has no map_id — skipping`);
+          continue;
+        }
 
-        detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
-        const primaryDet = detections[0];
+        const sortedDetections = [...detections].sort(
+          (a, b) => (b.rssi ?? -999) - (a.rssi ?? -999),
+        );
+        const primaryDet = sortedDetections[0];
+
+        const slimDetections = sortedDetections.map((d) => ({
+          ap_mac: d.ap_mac,
+          ap_name:
+            this.apMap.get((d.ap_mac || "").toLowerCase().trim())?.name ||
+            d.ap_mac,
+          rssi: d.rssi ?? null,
+          beam: d.beam ?? null,
+          map_id: d.map_id ?? null,
+          x: d.x ?? null,
+          y: d.y ?? null,
+          last_seen: d.last_seen ?? null,
+        }));
+
+        const detectionsCount = slimDetections.length;
+        let locationConfidence = "Low (Single AP)";
+        if (detectionsCount >= 3) {
+          locationConfidence = "High (Triangulated)";
+        } else if (detectionsCount === 2) {
+          locationConfidence = "Medium (2 APs)";
+        }
+
+        const apInfo = this.apMap.get(
+          (primaryDet.ap_mac || "").toLowerCase().trim(),
+        );
+
+        const lastSeenSec =
+          primaryDet.last_seen ?? primaryDet.timestamp ?? null;
+        const lastSeenMs = lastSeenSec ? lastSeenSec * 1000 : null;
+        const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
+        const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
 
         processedAssets.push({
           mac,
           device_name: firstDet.device_name || "Unknown",
           map_id: firstDet.map_id,
-          detections, // raw detections passed through
+          map_name: this.mapMap.get(firstDet.map_id) || null,
+
+          // ✅ PASSING RAW MIST COORDINATES EXACTLY AS THEY COME
+          x: primaryDet.x ?? apInfo?.x ?? null,
+          y: primaryDet.y ?? apInfo?.y ?? null,
+          x_m: primaryDet.x_m ?? apInfo?.x_m ?? null,
+          y_m: primaryDet.y_m ?? apInfo?.y_m ?? null,
+
           ap_mac: primaryDet.ap_mac,
-          ap_name:
-            this.apMap.get((primaryDet.ap_mac || "").toLowerCase().trim())
-              ?.name || primaryDet.ap_mac,
+          ap_name: apInfo?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
-          beam: primaryDet.beam ?? null,
-          radius: ASSET_RADIUS_M, // radius in meters — descriptive only
+          beam:
+            Number.isInteger(primaryDet.beam) &&
+            primaryDet.beam >= 0 &&
+            primaryDet.beam <= 7
+              ? primaryDet.beam
+              : null,
+
+          radius: primaryDet.radius || DEFAULT_ASSET_RADIUS_M,
+          detections_count: detectionsCount,
+          location_confidence: locationConfidence,
+
+          service_uuid: firstDet.service_uuid ?? firstDet.service_uuids ?? null,
+          ibeacon_uuid: firstDet.ibeacon_uuid ?? null,
+          ibeacon_major: firstDet.ibeacon_major ?? null,
+          ibeacon_minor: firstDet.ibeacon_minor ?? null,
+          eddystone_namespace: firstDet.eddystone_namespace ?? null,
+          eddystone_instance: firstDet.eddystone_instance ?? null,
+
+          last_seen: lastSeenMs,
+          age_ms: ageMs,
+          is_stale: isStale,
+          updated_at: new Date().toISOString(),
+
+          detections: slimDetections,
         });
       } catch (err) {
         console.error(`Error processing asset ${mac}:`, err);
