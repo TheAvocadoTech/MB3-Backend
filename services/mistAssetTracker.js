@@ -14,8 +14,9 @@ if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
 const API_TOKEN = process.env.MIST_API_TOKEN;
 if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
 
-// Fallback radius if Mist doesn't provide one
-const DEFAULT_ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
+// Radius (in meters) that will be attached to each asset payload.
+// Purely descriptive — no math done here.
+const ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
 
 // Redis config
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
@@ -198,68 +199,23 @@ class AssetTracker extends EventEmitter {
     for (const [mac, detections] of assetGroups) {
       try {
         const firstDet = detections[0];
-        if (!firstDet.map_id) {
-          console.warn(`Asset ${mac} has no map_id — skipping`);
-          continue;
-        }
+        if (!firstDet.map_id) continue;
 
-        // Sort by RSSI to find the strongest detection
         detections.sort((a, b) => (b.rssi ?? -999) - (a.rssi ?? -999));
         const primaryDet = detections[0];
-
-        // Determine location confidence based on how many APs heard the tag
-        const detectionsCount = detections.length;
-        let locationConfidence = "Low (Single AP)";
-        if (detectionsCount >= 3) {
-          locationConfidence = "High (Triangulated)";
-        } else if (detectionsCount === 2) {
-          locationConfidence = "Medium (2 APs)";
-        }
-
-        // Mist's calculated location (or fallback to the strongest AP's known location)
-        const apInfo = this.apMap.get(
-          (primaryDet.ap_mac || "").toLowerCase().trim(),
-        );
 
         processedAssets.push({
           mac,
           device_name: firstDet.device_name || "Unknown",
           map_id: firstDet.map_id,
           detections, // raw detections passed through
-
-          // Location Data
-          x: primaryDet.x ?? apInfo?.x ?? null,
-          y: primaryDet.y ?? apInfo?.y ?? null,
-          x_m: primaryDet.x_m ?? apInfo?.x_m ?? null,
-          y_m: primaryDet.y_m ?? apInfo?.y_m ?? null,
-
-          // AP Data
           ap_mac: primaryDet.ap_mac,
-          ap_name: apInfo?.name || primaryDet.ap_mac,
+          ap_name:
+            this.apMap.get((primaryDet.ap_mac || "").toLowerCase().trim())
+              ?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
-          beam:
-            Number.isInteger(primaryDet.beam) &&
-            primaryDet.beam >= 0 &&
-            primaryDet.beam <= 7
-              ? primaryDet.beam
-              : null,
-
-          // Accuracy & Confidence
-          radius: primaryDet.radius || DEFAULT_ASSET_RADIUS_M,
-          detections_count: detectionsCount,
-          location_confidence: locationConfidence,
-
-          // Tag Identity (iBeacon / Eddystone)
-          service_uuid: firstDet.service_uuid ?? firstDet.service_uuids ?? null,
-          ibeacon_uuid: firstDet.ibeacon_uuid ?? null,
-          ibeacon_major: firstDet.ibeacon_major ?? null,
-          ibeacon_minor: firstDet.ibeacon_minor ?? null,
-          eddystone_namespace: firstDet.eddystone_namespace ?? null,
-          eddystone_instance: firstDet.eddystone_instance ?? null,
-
-          // Freshness
-          last_seen: primaryDet.last_seen ?? primaryDet.timestamp ?? null,
-          updated_at: new Date().toISOString(),
+          beam: primaryDet.beam ?? null,
+          radius: ASSET_RADIUS_M, // radius in meters — descriptive only
         });
       } catch (err) {
         console.error(`Error processing asset ${mac}:`, err);
