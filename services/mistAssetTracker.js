@@ -4,6 +4,7 @@ const EventEmitter = require("events");
 const fs = require("fs");
 const path = require("path");
 const Redis = require("ioredis");
+const WebSocket = require("ws"); // <-- ADDED: WebSocket package
 
 const SITE_ID = process.env.MIST_SITE_ID;
 if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
@@ -76,6 +77,11 @@ class AssetTracker extends EventEmitter {
     this.lastFetchAt = 0;
     this.inflight = null;
 
+    // WebSocket properties
+    this.ws = null;
+    this.mapIds = new Set();
+    this.wsReconnectTimeout = null;
+
     this.redis = new Redis(REDIS_URL, {
       maxRetriesPerRequest: 3,
       enableOfflineQueue: false,
@@ -90,6 +96,9 @@ class AssetTracker extends EventEmitter {
 
     this._loadStaticAPs();
     this._hydrateFromRedis();
+
+    // Delay WebSocket connection slightly to ensure mapIds are collected
+    setTimeout(() => this._connectWebSocket(), 2000);
   }
 
   _loadStaticAPs() {
@@ -103,6 +112,12 @@ class AssetTracker extends EventEmitter {
 
       for (const ap of apList) {
         if (!ap.mac) continue;
+
+        // Collect map IDs for WebSocket subscription
+        if (ap.map_id) {
+          this.mapIds.add(ap.map_id);
+        }
+
         this.apMap.set(ap.mac.toLowerCase().trim(), {
           name: ap.name || ap.mac,
           map_id: ap.map_id || null,
@@ -185,6 +200,11 @@ class AssetTracker extends EventEmitter {
       const response = await mist.get(`/sites/${SITE_ID}/stats/assets`);
 
       if (Array.isArray(response.data) && response.data.length > 0) {
+        // Also extract any map_ids we might have missed from ap_list.json
+        response.data.forEach((a) => {
+          if (a.map_id) this.mapIds.add(a.map_id);
+        });
+
         const processed = this._processAssetData(response.data);
         this.cachedProcessedAssets = processed;
         this.lastFetchAt = Date.now();
@@ -219,26 +239,96 @@ class AssetTracker extends EventEmitter {
   }
 
   /**
+   * WEBSOCKET: Connect and subscribe to live map asset updates
+   */
+  _connectWebSocket() {
+    const wsUrl = "wss://api-ws.mist.com/api-ws/v1/stream";
+
+    this.ws = new WebSocket(wsUrl, {
+      headers: {
+        Authorization: `Token ${API_TOKEN}`,
+      },
+    });
+
+    this.ws.on("open", () => {
+      console.log("✅ Mist WebSocket connected");
+      // Subscribe to each known map ID
+      for (const mapId of this.mapIds) {
+        const channel = `/sites/${SITE_ID}/stats/maps/${mapId}/assets`;
+        this.ws.send(JSON.stringify({ subscribe: channel }));
+        console.log(`📡 WebSocket Subscribed to: ${channel}`);
+      }
+    });
+
+    this.ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(raw);
+        // Mist pushes messages with event: "data", channel: "...", data: "{...}"
+        if (msg.event === "data" && msg.data) {
+          const payload =
+            typeof msg.data === "string" ? JSON.parse(msg.data) : msg.data;
+          this._handleRealtimeAsset(payload);
+        }
+      } catch (err) {
+        console.warn("WebSocket message parse error:", err.message);
+      }
+    });
+
+    this.ws.on("close", () => {
+      console.warn("WebSocket closed, reconnecting in 5s...");
+      if (this.wsReconnectTimeout) clearTimeout(this.wsReconnectTimeout);
+      this.wsReconnectTimeout = setTimeout(
+        () => this._connectWebSocket(),
+        5000,
+      );
+    });
+
+    this.ws.on("error", (err) =>
+      console.error("WebSocket error:", err.message),
+    );
+  }
+
+  /**
+   * WEBSOCKET: Handle single real-time asset update
+   */
+  _handleRealtimeAsset(asset) {
+    if (!asset || !asset.mac) return;
+
+    // Reuse existing fusion logic by wrapping the single asset in an array
+    const processed = this._processAssetData([asset]);
+    if (processed.length === 0) return;
+
+    const updated = processed[0];
+
+    // Update in-memory cache
+    const idx = this.cachedProcessedAssets.findIndex(
+      (a) => a.mac === updated.mac,
+    );
+    if (idx >= 0) {
+      this.cachedProcessedAssets[idx] = updated;
+    } else {
+      this.cachedProcessedAssets.push(updated);
+    }
+
+    // 🔑 CRITICAL: Emit immediately so frontend updates in real-time
+    this.emit("assets", this.cachedProcessedAssets);
+
+    // Save to Redis in the background (non-blocking)
+    const json = safeJson(this.cachedProcessedAssets);
+    if (json) {
+      this.redis.set(CACHE_KEY, json, "EX", CACHE_TTL_SEC).catch(() => {});
+    }
+  }
+
+  /**
    * Weighted fusion of AP detections to estimate asset location.
-   * Each detection is weighted by its linear RSSI power.
-   *
-   * Strategy:
-   *  - For each detection, resolve the AP's absolute map position (x_m/y_m preferred,
-   *    fallback to x/y pixel coords or AP static position from ap_list.json).
-   *  - If a detection has its own coordinates (x/y or x_m/y_m) we use them directly
-   *    (Mist may already give refined per-detection position).
-   *  - Otherwise, we project from the AP using its beam direction (0–7) and the
-   *    RSSI-estimated distance.
-   *  - Finally we do a weighted average of all projected points.
    */
   _computeFusedLocation(mac, detections, apInfoForPrimary) {
     const validDets = detections.filter(
       (d) => d.x != null || d.y != null || d.x_m != null || d.y_m != null,
     );
 
-    // Check if Mist already gave absolute coordinates per detection
     const hasAbsolute = validDets.some((d) => d.x_m != null && d.y_m != null);
-
     const weightedPoints = [];
 
     for (const det of detections) {
@@ -247,7 +337,7 @@ class AssetTracker extends EventEmitter {
 
       let px = null;
       let py = null;
-      let pxs = null; // metric coords
+      let pxs = null;
       let pys = null;
 
       // 1) Prefer Mist-provided absolute metric coords for this detection
@@ -276,12 +366,10 @@ class AssetTracker extends EventEmitter {
         const beam = det.beam;
 
         if (dist != null && Number.isInteger(beam) && beam >= 0 && beam <= 7) {
-          // Beam 0 points "up"/north in Mist convention; rotate 45° per index.
-          // Beam angle: 0→0°, 1→45°, 2→90°, ... 7→315° measured clockwise from north.
           const angleDeg = beam * 45;
           const angleRad = (angleDeg * Math.PI) / 180;
           const dx = dist * Math.sin(angleRad);
-          const dy = -dist * Math.cos(angleRad); // negative because y grows downward in pixel space
+          const dy = -dist * Math.cos(angleRad);
 
           px = baseX + dx;
           py = baseY + dy;
@@ -290,7 +378,6 @@ class AssetTracker extends EventEmitter {
             pys = py;
           }
         } else {
-          // No beam info — just use AP location
           px = baseX;
           py = baseY;
           pxs = isMetric ? baseX : null;
@@ -315,10 +402,7 @@ class AssetTracker extends EventEmitter {
       });
     }
 
-    // If Mist already gave absolute coords, and one detection has them, just
-    // return that (avoid mixing coordinate systems).
     if (hasAbsolute) {
-      // Pick strongest detection with absolute coords
       const withAbs = weightedPoints.filter(
         (p) => p.x_m != null && p.y_m != null,
       );
@@ -336,11 +420,8 @@ class AssetTracker extends EventEmitter {
       }
     }
 
-    if (weightedPoints.length === 0) {
-      return null;
-    }
+    if (weightedPoints.length === 0) return null;
 
-    // Weighted average in whichever coordinate system we have.
     const useMetric = weightedPoints.some((p) => p.x_m != null);
     let sumW = 0;
     let sumX = 0;
@@ -413,7 +494,6 @@ class AssetTracker extends EventEmitter {
             x_m: d.x_m ?? null,
             y_m: d.y_m ?? null,
             last_seen: d.last_seen ?? null,
-            // Helpful for debugging the fusion:
             distance_m: rssiToDistance(d.rssi),
             weight: rssiWeight(d.rssi),
           };
@@ -437,10 +517,8 @@ class AssetTracker extends EventEmitter {
         const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
         const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
 
-        // 🔑 Fuse all detections (RSSI-weighted) for the real location
         const fused = this._computeFusedLocation(mac, sortedDetections, apInfo);
 
-        // If fusion failed, fall back to primary detection coordinates
         const finalX = fused?.x ?? primaryDet.x ?? apInfo?.x ?? null;
         const finalY = fused?.y ?? primaryDet.y ?? apInfo?.y ?? null;
         const finalXm = fused?.x_m ?? primaryDet.x_m ?? apInfo?.x_m ?? null;
@@ -452,7 +530,6 @@ class AssetTracker extends EventEmitter {
           map_id: firstDet.map_id,
           map_name: this.mapMap.get(firstDet.map_id) || null,
 
-          // ✅ FUSED (RSSI-weighted) COORDINATES — this is what should be plotted
           x: finalX,
           y: finalY,
           x_m: finalXm,
@@ -460,7 +537,6 @@ class AssetTracker extends EventEmitter {
           location_method: fused?.method || "primary_fallback",
           location_contributing_aps: fused?.contributing ?? detectionsCount,
 
-          // Primary AP (strongest RSSI) for context
           ap_mac: primaryDet.ap_mac,
           ap_name: apInfo?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
@@ -487,7 +563,6 @@ class AssetTracker extends EventEmitter {
           is_stale: isStale,
           updated_at: new Date().toISOString(),
 
-          // Per-AP raw data with resolved rssi / beam / distance / weight
           detections: slimDetections,
         });
       } catch (err) {
@@ -499,6 +574,12 @@ class AssetTracker extends EventEmitter {
   }
 
   async close() {
+    if (this.ws) {
+      this.ws.terminate(); // Close WebSocket connection
+    }
+    if (this.wsReconnectTimeout) {
+      clearTimeout(this.wsReconnectTimeout);
+    }
     await this.redis.quit().catch(() => {});
   }
 }
