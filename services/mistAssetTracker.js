@@ -575,4 +575,3 @@ class AssetTracker extends EventEmitter {
 
 const assetTracker = new AssetTracker();
 module.exports = assetTracker;
-c;
