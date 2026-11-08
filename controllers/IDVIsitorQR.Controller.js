@@ -1795,6 +1795,15 @@ exports.getVisitorLocation = async (req, res) => {
     const isStable = stability > 0.7;
     const beamAngle =
       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
+    // 👇 1. CALCULATE METERS HERE
+    let x_m = null;
+    let y_m = null;
+    const mapConfig = MAP_CONFIGS[rawData.map_id];
+
+    if (mapConfig && rawData.x != null && rawData.y != null) {
+      x_m = (rawData.x - mapConfig.origin_x) / mapConfig.ppm;
+      y_m = (mapConfig.origin_y - rawData.y) / mapConfig.ppm;
+    }
 
     const locationData = {
       visitor: {
@@ -1812,6 +1821,11 @@ exports.getVisitorLocation = async (req, res) => {
       location: {
         x: rawData.x || null,
         y: rawData.y || null,
+
+        // 👇 2. ADD THESE TWO LINES
+        x_m: x_m,
+        y_m: y_m,
+
         name: rawData.name || matchedAsset.device_name,
         mac: rawData.mac,
         map_id: rawData.map_id,
@@ -1832,6 +1846,42 @@ exports.getVisitorLocation = async (req, res) => {
       proximity: proximityStatus,
       timestamp: new Date().toISOString(),
     };
+    // const locationData = {
+    //   visitor: {
+    //     id: visitor._id,
+    //     name: visitor.visitorName,
+    //     phone: visitor.phoneNumber,
+    //     email: visitor.email,
+    //     company: visitor.company,
+    //     idNumber: visitor.idNumber,
+    //     purpose: visitor.purpose,
+    //     checkedIn: visitor.checkedIn,
+    //     checkedInAt: visitor.checkedInAt,
+    //     qrExpiresAt: visitor.qrExpiresAt,
+    //   },
+    //   location: {
+    //     x: rawData.x || null,
+    //     y: rawData.y || null,
+    //     name: rawData.name || matchedAsset.device_name,
+    //     mac: rawData.mac,
+    //     map_id: rawData.map_id,
+    //     ap_mac: rawData.ap_mac,
+    //     last_seen: rawData.last_seen,
+    //     rssi: rawData.rssi,
+    //     beam: rawData.beam,
+    //     beam_angle: beamAngle,
+    //     device_name: rawData.device_name,
+    //     manufacture: rawData.manufacture,
+    //     stability: stability,
+    //     is_stable: isStable,
+    //     smoothed_position: matchedAsset.position || null,
+    //     ap_history: matchedAsset.apHistory || [],
+    //   },
+    //   target_coordinates: { x: targetX, y: targetY },
+    //   distance: distance,
+    //   proximity: proximityStatus,
+    //   timestamp: new Date().toISOString(),
+    // };
 
     if (rawData.map_id) {
       const worldCoords = convertMistToWorld(
