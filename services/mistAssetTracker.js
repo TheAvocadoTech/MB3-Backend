@@ -11,19 +11,55 @@ if (!SITE_ID) throw new Error("MIST_SITE_ID environment variable required");
 const API_TOKEN = process.env.MIST_API_TOKEN;
 if (!API_TOKEN) throw new Error("MIST_API_TOKEN environment variable required");
 
+// Config
 const DEFAULT_ASSET_RADIUS_M = parseInt(process.env.ASSET_RADIUS_M, 10) || 5;
 const STALE_THRESHOLD_MS = 120_000; // 2 minutes
-
 const REDIS_URL = process.env.REDIS_URL || "redis://127.0.0.1:6379";
 const CACHE_KEY = `mist:assets:${SITE_ID}`;
 const BACKOFF_KEY = `mist:backoff:${SITE_ID}`;
 const CACHE_TTL_SEC = parseInt(process.env.MIST_CACHE_TTL_SEC, 10) || 30;
 const MIN_REFRESH_MS = parseInt(process.env.MIST_MIN_REFRESH_MS, 10) || 5000;
 
-// Path-loss exponent for RSSI → distance conversion (indoor ~2.0–3.0)
+// Path-loss model parameters (RSSI to Distance)
 const PATH_LOSS_EXPONENT = parseFloat(process.env.PATH_LOSS_EXPONENT) || 2.5;
-// RSSI at 1 meter reference (dBm)
 const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -45;
+
+// Smoothing / Jump prevention
+const POSITION_ALPHA = parseFloat(process.env.POSITION_ALPHA) || 0.35;
+const MAX_JUMP_M = parseFloat(process.env.MAX_JUMP_M) || 15;
+
+// ============================================================
+// MAP CONFIGS
+// IMPORTANT: Add all map UUIDs used in your site here.
+// ============================================================
+const MAP_CONFIGS = {
+  "30141417-44ea-4982-993c-6225c9f08315": {
+    name: "MB3-F00",
+    ppm: 50.07391564392213,
+    origin_x: 306.45106507695385,
+    origin_y: 3856.483584010582,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  "cfa55e13-794f-4081-b1b7-e35f1ea67325": {
+    name: "MB3-F01",
+    ppm: 57.275559331634064,
+    origin_x: 6.786923314266026,
+    origin_y: 4134.933029216576,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  // ⚠️ FILL THIS IN FOR THE FLOOR IN YOUR SCREENSHOT:
+  // Go to Mist Dashboard -> Maps -> [Your Map] -> Copy UUID from URL.
+  // "YOUR-MAP-UUID-HERE": {
+  //   name: "Ground Floor",
+  //   ppm: 50.0,       // Pixels per meter (find in map settings)
+  //   origin_x: 0,     // X pixel of meter (0,0)
+  //   origin_y: 0,     // Y pixel of meter (0,0)
+  //   offset_x: 0,
+  //   offset_y: 0,
+  // },
+};
 
 const mist = axios.create({
   baseURL: "https://api.mist.com/api/v1",
@@ -34,6 +70,7 @@ const mist = axios.create({
   timeout: 10000,
 });
 
+// Safely stringify for Redis
 const safeJson = (obj) => {
   try {
     return JSON.stringify(obj, (k, v) =>
@@ -45,26 +82,25 @@ const safeJson = (obj) => {
   }
 };
 
-/**
- * Convert RSSI (dBm) to estimated distance in meters using log-distance path loss model.
- * d = 10 ^ ((RSSI_1m - RSSI) / (10 * n))
- */
+// Convert dBm to estimated meters
 function rssiToDistance(rssi) {
   if (rssi == null || !Number.isFinite(rssi)) return null;
   const d = Math.pow(10, (RSSI_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT));
-  // Clamp to sane indoor range
   return Math.min(Math.max(d, 0.3), 100);
 }
 
-/**
- * Weight for RSSI-based fusion. Stronger signal = higher weight.
- * Uses linear power ratio so a 10 dB difference ≈ 10× weight.
- */
+// Weight detections based on signal strength (linear power ratio)
 function rssiWeight(rssi) {
   if (rssi == null || !Number.isFinite(rssi)) return 0;
-  // Convert dBm to linear power relative to a floor of -100 dBm
   const clamped = Math.max(rssi, -100);
-  return Math.pow(10, clamped / 10); // 10^(rssi/10)
+  return Math.pow(10, clamped / 10);
+}
+
+// Ensure beam is a valid integer
+function coerceBeam(b) {
+  const n = Number(b);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return Math.round(n); // Allow 0-63, do not strictly cap at 7
 }
 
 class AssetTracker extends EventEmitter {
@@ -73,6 +109,7 @@ class AssetTracker extends EventEmitter {
     this.cachedProcessedAssets = [];
     this.apMap = new Map();
     this.mapMap = new Map();
+    this.smoothedByMac = new Map(); // Tracks smoothing state per tag
     this.lastFetchAt = 0;
     this.inflight = null;
 
@@ -92,30 +129,64 @@ class AssetTracker extends EventEmitter {
     this._hydrateFromRedis();
   }
 
+  // ============================================================
+  // AP LIST LOADING
+  // ============================================================
   _loadStaticAPs() {
     try {
       const filePath = path.join(__dirname, "ap_list.json");
-      if (!fs.existsSync(filePath)) return;
+      if (!fs.existsSync(filePath)) {
+        console.warn("⚠️ ap_list.json not found.");
+        return;
+      }
 
       const raw = fs.readFileSync(filePath, "utf8");
       const apList = JSON.parse(raw);
       if (!Array.isArray(apList)) return;
 
+      let missingMeters = 0;
+
       for (const ap of apList) {
         if (!ap.mac) continue;
+
+        let x_m = ap.x_m;
+        let y_m = ap.y_m;
+
+        // Auto-convert pixels to meters if missing
+        if (
+          (x_m == null || y_m == null) &&
+          ap.map_id &&
+          ap.x != null &&
+          ap.y != null &&
+          MAP_CONFIGS[ap.map_id]
+        ) {
+          const cfg = MAP_CONFIGS[ap.map_id];
+          x_m = (ap.x - cfg.origin_x) / cfg.ppm + (cfg.offset_x || 0);
+          y_m = (cfg.origin_y - ap.y) / cfg.ppm + (cfg.offset_y || 0);
+        }
+
+        if (x_m == null || y_m == null) missingMeters++;
+
         this.apMap.set(ap.mac.toLowerCase().trim(), {
           name: ap.name || ap.mac,
           map_id: ap.map_id || null,
           x: ap.x,
           y: ap.y,
-          x_m: ap.x_m,
-          y_m: ap.y_m,
+          x_m,
+          y_m,
         });
 
         if (ap.map_id && ap.map_name) {
           this.mapMap.set(ap.map_id, ap.map_name);
         }
       }
+
+      console.log(
+        `✅ Loaded ${this.apMap.size} APs from ap_list.json` +
+          (missingMeters
+            ? ` (${missingMeters} missing x_m/y_m — check MAP_CONFIGS)`
+            : ""),
+      );
     } catch (err) {
       console.warn("⚠️ Could not load ap_list.json:", err.message);
     }
@@ -163,6 +234,9 @@ class AssetTracker extends EventEmitter {
     }
   }
 
+  // ============================================================
+  // FETCHING & CACHING
+  // ============================================================
   async getAssets() {
     if (Date.now() - this.lastFetchAt < MIN_REFRESH_MS) {
       return this.cachedProcessedAssets;
@@ -218,161 +292,169 @@ class AssetTracker extends EventEmitter {
     }
   }
 
-  /**
-   * Weighted fusion of AP detections to estimate asset location.
-   * Each detection is weighted by its linear RSSI power.
-   *
-   * Strategy:
-   *  - For each detection, resolve the AP's absolute map position (x_m/y_m preferred,
-   *    fallback to x/y pixel coords or AP static position from ap_list.json).
-   *  - If a detection has its own coordinates (x/y or x_m/y_m) we use them directly
-   *    (Mist may already give refined per-detection position).
-   *  - Otherwise, we project from the AP using its beam direction (0–7) and the
-   *    RSSI-estimated distance.
-   *  - Finally we do a weighted average of all projected points.
-   */
-  _computeFusedLocation(mac, detections, apInfoForPrimary) {
-    const validDets = detections.filter(
-      (d) => d.x != null || d.y != null || d.x_m != null || d.y_m != null,
-    );
+  // ============================================================
+  // COORDINATE CONVERSIONS
+  // ============================================================
+  _pixelToMeters(x, y, mapId) {
+    if (x == null || y == null) return null;
+    const cfg = MAP_CONFIGS[mapId];
+    if (!cfg) return null;
+    return {
+      x_m: (x - cfg.origin_x) / cfg.ppm + (cfg.offset_x || 0),
+      y_m: (cfg.origin_y - y) / cfg.ppm + (cfg.offset_y || 0),
+    };
+  }
 
-    // Check if Mist already gave absolute coordinates per detection
-    const hasAbsolute = validDets.some((d) => d.x_m != null && d.y_m != null);
+  _metersToPixel(x_m, y_m, mapId) {
+    if (x_m == null || y_m == null) return null;
+    const cfg = MAP_CONFIGS[mapId];
+    if (!cfg) return null;
+    return {
+      x: (x_m - (cfg.offset_x || 0)) * cfg.ppm + cfg.origin_x,
+      y: cfg.origin_y - (y_m - (cfg.offset_y || 0)) * cfg.ppm,
+    };
+  }
 
+  // ============================================================
+  // FUSION ENGINE
+  // ============================================================
+  _computeFusedLocation(mac, detections, mapId) {
     const weightedPoints = [];
 
     for (const det of detections) {
       const apMacKey = (det.ap_mac || "").toLowerCase().trim();
       const apStatic = this.apMap.get(apMacKey);
 
-      let px = null;
-      let py = null;
-      let pxs = null; // metric coords
-      let pys = null;
+      let x_m = null;
+      let y_m = null;
+      let source = null;
 
-      // 1) Prefer Mist-provided absolute metric coords for this detection
+      // 1. Mist gave metric coords directly
       if (det.x_m != null && det.y_m != null) {
-        pxs = det.x_m;
-        pys = det.y_m;
-        px = det.x;
-        py = det.y;
+        x_m = det.x_m;
+        y_m = det.y_m;
+        source = "det_metric";
       }
-      // 2) Then Mist-provided pixel coords
+      // 2. Mist gave pixel coords — convert them
       else if (det.x != null && det.y != null) {
-        px = det.x;
-        py = det.y;
-        pxs = det.x_m ?? null;
-        pys = det.y_m ?? null;
-      }
-      // 3) Fall back to the AP's own location + beam/distance projection
-      else if (apStatic) {
-        const baseX = apStatic.x_m ?? apStatic.x ?? null;
-        const baseY = apStatic.y_m ?? apStatic.y ?? null;
-        const isMetric = apStatic.x_m != null;
-
-        if (baseX == null || baseY == null) continue;
-
-        const dist = rssiToDistance(det.rssi);
-        const beam = det.beam;
-
-        if (dist != null && Number.isInteger(beam) && beam >= 0 && beam <= 7) {
-          // Beam 0 points "up"/north in Mist convention; rotate 45° per index.
-          // Beam angle: 0→0°, 1→45°, 2→90°, ... 7→315° measured clockwise from north.
-          const angleDeg = beam * 45;
-          const angleRad = (angleDeg * Math.PI) / 180;
-          const dx = dist * Math.sin(angleRad);
-          const dy = -dist * Math.cos(angleRad); // negative because y grows downward in pixel space
-
-          px = baseX + dx;
-          py = baseY + dy;
-          if (isMetric) {
-            pxs = px;
-            pys = py;
-          }
-        } else {
-          // No beam info — just use AP location
-          px = baseX;
-          py = baseY;
-          pxs = isMetric ? baseX : null;
-          pys = isMetric ? baseY : null;
+        const m = this._pixelToMeters(det.x, det.y, mapId);
+        if (m) {
+          x_m = m.x_m;
+          y_m = m.y_m;
+          source = "det_pixel";
         }
-      } else {
-        continue;
       }
+
+      // 3. Fallback to AP location + beam projection
+      if (x_m == null && apStatic) {
+        let baseX = apStatic.x_m;
+        let baseY = apStatic.y_m;
+
+        if (
+          baseX == null &&
+          apStatic.x != null &&
+          apStatic.y != null &&
+          apStatic.map_id
+        ) {
+          const m = this._pixelToMeters(
+            apStatic.x,
+            apStatic.y,
+            apStatic.map_id,
+          );
+          if (m) {
+            baseX = m.x_m;
+            baseY = m.y_m;
+          }
+        }
+
+        if (baseX != null && baseY != null) {
+          const dist = rssiToDistance(det.rssi);
+          const beam = coerceBeam(det.beam);
+
+          if (dist != null && beam != null) {
+            // Beam 0 is North, 1 is NE, etc.
+            const angleRad = (beam * 45 * Math.PI) / 180;
+            x_m = baseX + dist * Math.sin(angleRad);
+            y_m = baseY + dist * Math.cos(angleRad);
+            source = "ap_beam_projection";
+          } else {
+            x_m = baseX;
+            y_m = baseY;
+            source = "ap_position";
+          }
+        }
+      }
+
+      if (x_m == null || y_m == null) continue;
 
       const w = rssiWeight(det.rssi);
       if (w <= 0) continue;
 
       weightedPoints.push({
-        x: px,
-        y: py,
-        x_m: pxs,
-        y_m: pys,
+        x_m,
+        y_m,
         weight: w,
         rssi: det.rssi,
         ap_mac: det.ap_mac,
         beam: det.beam,
+        source,
       });
     }
 
-    // If Mist already gave absolute coords, and one detection has them, just
-    // return that (avoid mixing coordinate systems).
-    if (hasAbsolute) {
-      // Pick strongest detection with absolute coords
-      const withAbs = weightedPoints.filter(
-        (p) => p.x_m != null && p.y_m != null,
-      );
-      if (withAbs.length > 0) {
-        withAbs.sort((a, b) => b.weight - a.weight);
-        const best = withAbs[0];
-        return {
-          x: best.x ?? best.x_m,
-          y: best.y ?? best.y_m,
-          x_m: best.x_m,
-          y_m: best.y_m,
-          method: "mist_absolute",
-          contributing: withAbs.length,
-        };
-      }
-    }
+    if (weightedPoints.length === 0) return null;
 
-    if (weightedPoints.length === 0) {
-      return null;
-    }
-
-    // Weighted average in whichever coordinate system we have.
-    const useMetric = weightedPoints.some((p) => p.x_m != null);
     let sumW = 0;
     let sumX = 0;
     let sumY = 0;
-    let countContrib = 0;
-
     for (const p of weightedPoints) {
-      const x = useMetric ? p.x_m : p.x;
-      const y = useMetric ? p.y_m : p.y;
-      if (x == null || y == null) continue;
       sumW += p.weight;
-      sumX += p.weight * x;
-      sumY += p.weight * y;
-      countContrib++;
+      sumX += p.weight * p.x_m;
+      sumY += p.weight * p.y_m;
     }
-
-    if (sumW <= 0 || countContrib === 0) return null;
+    if (sumW <= 0) return null;
 
     return {
-      x: sumX / sumW,
-      y: sumY / sumW,
-      x_m: useMetric ? sumX / sumW : null,
-      y_m: useMetric ? sumY / sumW : null,
-      method: useMetric ? "weighted_metric" : "weighted_pixel",
-      contributing: countContrib,
+      x_m: sumX / sumW,
+      y_m: sumY / sumW,
+      method: `weighted_metric(${weightedPoints.length} APs)`,
+      contributing: weightedPoints.length,
     };
   }
 
+  // ============================================================
+  // SMOOTHING (EMA + Jump Damping)
+  // ============================================================
+  _smoothPosition(mac, x_m, y_m) {
+    const prev = this.smoothedByMac.get(mac);
+    if (!prev) {
+      this.smoothedByMac.set(mac, { x_m, y_m, ts: Date.now() });
+      return { x_m, y_m };
+    }
+
+    const dx = x_m - prev.x_m;
+    const dy = y_m - prev.y_m;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    // If it jumps more than MAX_JUMP_M (e.g. 15 meters), soften the movement
+    let alpha = POSITION_ALPHA;
+    if (dist > MAX_JUMP_M) {
+      alpha = POSITION_ALPHA * (MAX_JUMP_M / dist);
+    }
+
+    const sx = prev.x_m + alpha * dx;
+    const sy = prev.y_m + alpha * dy;
+    this.smoothedByMac.set(mac, { x_m: sx, y_m: sy, ts: Date.now() });
+    return { x_m: sx, y_m: sy };
+  }
+
+  // ============================================================
+  // PROCESSING
+  // ============================================================
   _processAssetData(assets) {
     const processedAssets = [];
     const assetGroups = new Map();
 
+    // Group multiple AP detections by tag MAC
     for (const a of assets) {
       if (!a.mac) continue;
       let group = assetGroups.get(a.mac);
@@ -403,17 +485,13 @@ class AssetTracker extends EventEmitter {
             ap_mac: d.ap_mac,
             ap_name: apStatic?.name || d.ap_mac,
             rssi: d.rssi ?? null,
-            beam:
-              Number.isInteger(d.beam) && d.beam >= 0 && d.beam <= 7
-                ? d.beam
-                : null,
+            beam: coerceBeam(d.beam),
             map_id: d.map_id ?? null,
             x: d.x ?? null,
             y: d.y ?? null,
             x_m: d.x_m ?? null,
             y_m: d.y_m ?? null,
             last_seen: d.last_seen ?? null,
-            // Helpful for debugging the fusion:
             distance_m: rssiToDistance(d.rssi),
             weight: rssiWeight(d.rssi),
           };
@@ -421,11 +499,8 @@ class AssetTracker extends EventEmitter {
 
         const detectionsCount = slimDetections.length;
         let locationConfidence = "Low (Single AP)";
-        if (detectionsCount >= 3) {
-          locationConfidence = "High (Triangulated)";
-        } else if (detectionsCount === 2) {
-          locationConfidence = "Medium (2 APs)";
-        }
+        if (detectionsCount >= 3) locationConfidence = "High (Triangulated)";
+        else if (detectionsCount === 2) locationConfidence = "Medium (2 APs)";
 
         const apInfo = this.apMap.get(
           (primaryDet.ap_mac || "").toLowerCase().trim(),
@@ -437,57 +512,100 @@ class AssetTracker extends EventEmitter {
         const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
         const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
 
-        // 🔑 Fuse all detections (RSSI-weighted) for the real location
-        const fused = this._computeFusedLocation(mac, sortedDetections, apInfo);
+        // 1. Fuse
+        const fused = this._computeFusedLocation(
+          mac,
+          sortedDetections,
+          firstDet.map_id,
+        );
 
-        // If fusion failed, fall back to primary detection coordinates
-        const finalX = fused?.x ?? primaryDet.x ?? apInfo?.x ?? null;
-        const finalY = fused?.y ?? primaryDet.y ?? apInfo?.y ?? null;
-        const finalXm = fused?.x_m ?? primaryDet.x_m ?? apInfo?.x_m ?? null;
-        const finalYm = fused?.y_m ?? primaryDet.y_m ?? apInfo?.y_m ?? null;
+        // 2. Resolve Final Metric Coords
+        let x_m = fused?.x_m ?? null;
+        let y_m = fused?.y_m ?? null;
+
+        if (x_m == null && primaryDet.x != null && primaryDet.y != null) {
+          const m = this._pixelToMeters(
+            primaryDet.x,
+            primaryDet.y,
+            firstDet.map_id,
+          );
+          if (m) {
+            x_m = m.x_m;
+            y_m = m.y_m;
+          }
+        }
+
+        if (x_m == null && apInfo) {
+          if (apInfo.x_m != null) {
+            x_m = apInfo.x_m;
+            y_m = apInfo.y_m;
+          } else if (apInfo.x != null) {
+            const m = this._pixelToMeters(apInfo.x, apInfo.y, firstDet.map_id);
+            if (m) {
+              x_m = m.x_m;
+              y_m = m.y_m;
+            }
+          }
+        }
+
+        // 3. Smoothing
+        let smoothed = null;
+        if (x_m != null && y_m != null) {
+          smoothed = this._smoothPosition(mac, x_m, y_m);
+          x_m = smoothed.x_m;
+          y_m = smoothed.y_m;
+        }
+
+        // 4. Back to Pixels for UI
+        let x_px = null;
+        let y_px = null;
+        if (x_m != null && y_m != null) {
+          const px = this._metersToPixel(x_m, y_m, firstDet.map_id);
+          if (px) {
+            x_px = px.x;
+            y_px = px.y;
+          }
+        }
+
+        // Fallback for UI pixel coords
+        if (x_px == null && primaryDet.x != null) {
+          x_px = primaryDet.x;
+          y_px = primaryDet.y;
+        }
 
         processedAssets.push({
           mac,
-          device_name: firstDet.device_name || "Unknown",
+          device_name: firstDet.device_name || "Unknown Tag",
           map_id: firstDet.map_id,
           map_name: this.mapMap.get(firstDet.map_id) || null,
 
-          // ✅ FUSED (RSSI-weighted) COORDINATES — this is what should be plotted
-          x: finalX,
-          y: finalY,
-          x_m: finalXm,
-          y_m: finalYm,
-          location_method: fused?.method || "primary_fallback",
+          // METRIC (Meters) - Feeds UI diagnostics
+          x_m,
+          y_m,
+
+          // PIXELS - Feeds UI Map Marker
+          x: x_px,
+          y: y_px,
+
+          location_method: fused?.method || "fallback",
           location_contributing_aps: fused?.contributing ?? detectionsCount,
 
-          // Primary AP (strongest RSSI) for context
+          // BLE Diagnostics
           ap_mac: primaryDet.ap_mac,
           ap_name: apInfo?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
-          beam:
-            Number.isInteger(primaryDet.beam) &&
-            primaryDet.beam >= 0 &&
-            primaryDet.beam <= 7
-              ? primaryDet.beam
-              : null,
+          beam: coerceBeam(primaryDet.beam),
 
           radius: primaryDet.radius || DEFAULT_ASSET_RADIUS_M,
           detections_count: detectionsCount,
           location_confidence: locationConfidence,
-
-          service_uuid: firstDet.service_uuid ?? firstDet.service_uuids ?? null,
-          ibeacon_uuid: firstDet.ibeacon_uuid ?? null,
-          ibeacon_major: firstDet.ibeacon_major ?? null,
-          ibeacon_minor: firstDet.ibeacon_minor ?? null,
-          eddystone_namespace: firstDet.eddystone_namespace ?? null,
-          eddystone_instance: firstDet.eddystone_instance ?? null,
 
           last_seen: lastSeenMs,
           age_ms: ageMs,
           is_stale: isStale,
           updated_at: new Date().toISOString(),
 
-          // Per-AP raw data with resolved rssi / beam / distance / weight
+          // Raw array of all APs that heard this tag
           detections: slimDetections,
         });
       } catch (err) {
