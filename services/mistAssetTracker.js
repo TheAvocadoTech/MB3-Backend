@@ -21,12 +21,12 @@ const CACHE_TTL_SEC = parseInt(process.env.MIST_CACHE_TTL_SEC, 10) || 30;
 const MIN_REFRESH_MS = parseInt(process.env.MIST_MIN_REFRESH_MS, 10) || 5000;
 
 // Path-loss model parameters (RSSI to Distance)
-const PATH_LOSS_EXPONENT = parseFloat(process.env.PATH_LOSS_EXPONENT) || 2.5;
-const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -60; // Adjusted for tighter indoor bounds
+const PATH_LOSS_EXPONENT = parseFloat(process.env.PATH_LOSS_EXPONENT) || 2.0;
+const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -40; // 👈 FIXED: Use -40 for tighter indoor bounds
 
 // Smoothing / Jump prevention
-const POSITION_ALPHA = parseFloat(process.env.POSITION_ALPHA) || 0.35;
-const MAX_JUMP_M = parseFloat(process.env.MAX_JUMP_M) || 15;
+const POSITION_ALPHA = parseFloat(process.env.POSITION_ALPHA) || 0.15; // 👈 FIXED: More smoothing
+const MAX_JUMP_M = parseFloat(process.env.MAX_JUMP_M) || 5; // 👈 FIXED: Clamp jumps > 5m
 
 // ============================================================
 // MAP CONFIGS
@@ -45,6 +45,15 @@ const MAP_CONFIGS = {
     ppm: 57.275559331634064,
     origin_x: 6.786923314266026,
     origin_y: 4134.933029216576,
+    offset_x: 0,
+    offset_y: 0,
+  },
+  // 👇 REPLACE THIS WITH YOUR ACTUAL MAP UUID
+  "YOUR-MAP-UUID-HERE": {
+    name: "Ground Floor",
+    ppm: 50.0,
+    origin_x: 0,
+    origin_y: 0,
     offset_x: 0,
     offset_y: 0,
   },
@@ -73,7 +82,7 @@ const safeJson = (obj) => {
 function rssiToDistance(rssi) {
   if (rssi == null || !Number.isFinite(rssi)) return null;
   const d = Math.pow(10, (RSSI_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT));
-  return Math.min(Math.max(d, 0.3), 100);
+  return Math.min(Math.max(d, 0.5), 30); // 👈 Max 30m to prevent huge projections
 }
 
 function rssiWeight(rssi) {
@@ -164,7 +173,9 @@ class AssetTracker extends EventEmitter {
 
       console.log(
         `✅ Loaded ${this.apMap.size} APs from ap_list.json` +
-          (missingMeters ? ` (${missingMeters} missing x_m/y_m)` : ""),
+          (missingMeters
+            ? ` (${missingMeters} missing x_m/y_m — check MAP_CONFIGS)`
+            : ""),
       );
     } catch (err) {
       console.warn("⚠️ Could not load ap_list.json:", err.message);
@@ -333,7 +344,8 @@ class AssetTracker extends EventEmitter {
           const beam = coerceBeam(det.beam);
 
           if (dist != null && beam != null) {
-            const angleRad = (beam * 45 * Math.PI) / 180;
+            // 👈 FIXED: Use 15 degrees per beam for smoother direction
+            const angleRad = (beam * 15 * Math.PI) / 180;
             x_m = baseX + dist * Math.sin(angleRad);
             y_m = baseY + dist * Math.cos(angleRad);
             source = "ap_beam_projection";
@@ -393,7 +405,10 @@ class AssetTracker extends EventEmitter {
     const dist = Math.sqrt(dx * dx + dy * dy);
 
     let alpha = POSITION_ALPHA;
-    if (dist > MAX_JUMP_M) alpha = POSITION_ALPHA * (MAX_JUMP_M / dist);
+    // 👈 FIXED: If jump is larger than MAX_JUMP_M, heavily damp the alpha
+    if (dist > MAX_JUMP_M) {
+      alpha = POSITION_ALPHA * 0.2; // Cap it hard so it barely moves
+    }
 
     const sx = prev.x_m + alpha * dx;
     const sy = prev.y_m + alpha * dy;
@@ -459,7 +474,7 @@ class AssetTracker extends EventEmitter {
         const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
         const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
 
-        // 🛑 DISCARD STALE TAGS (Fixes the "ghost" tag issue)
+        // 🛑 STALE TAG FILTER
         if (isStale) {
           console.log(
             `🧹 Discarding stale tag ${mac} (last seen ${Math.round(ageMs / 1000)}s ago)`,
@@ -476,7 +491,6 @@ class AssetTracker extends EventEmitter {
         let x_m = fused?.x_m ?? null;
         let y_m = fused?.y_m ?? null;
 
-        // 1. Fallback to primary detection pixels
         if (x_m == null && primaryDet.x != null && primaryDet.y != null) {
           const m = this._pixelToMeters(
             primaryDet.x,
@@ -489,7 +503,6 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // 2. Fallback to AP Info location
         if (x_m == null && apInfo) {
           if (apInfo.x_m != null) {
             x_m = apInfo.x_m;
@@ -503,14 +516,13 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // 3. Smoothing
+        let smoothed = null;
         if (x_m != null && y_m != null) {
-          const smoothed = this._smoothPosition(mac, x_m, y_m);
+          smoothed = this._smoothPosition(mac, x_m, y_m);
           x_m = smoothed.x_m;
           y_m = smoothed.y_m;
         }
 
-        // 4. Convert back to Pixels
         let x_px = null;
         let y_px = null;
         if (x_m != null && y_m != null) {
@@ -531,14 +543,10 @@ class AssetTracker extends EventEmitter {
           device_name: firstDet.device_name || "Unknown Tag",
           map_id: firstDet.map_id,
           map_name: this.mapMap.get(firstDet.map_id) || null,
-
-          // 👇 FINAL FIXED METERS
-          x_m: x_m,
-          y_m: y_m,
-
+          x_m,
+          y_m,
           x: x_px,
           y: y_px,
-
           location_method: fused?.method || "fallback",
           location_contributing_aps: fused?.contributing ?? detectionsCount,
           ap_mac: primaryDet.ap_mac,

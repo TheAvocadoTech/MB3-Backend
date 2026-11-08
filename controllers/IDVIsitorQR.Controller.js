@@ -1795,15 +1795,6 @@ exports.getVisitorLocation = async (req, res) => {
     const isStable = stability > 0.7;
     const beamAngle =
       rawData.beam !== undefined ? BEAM_ANGLES[rawData.beam] : null;
-    // 👇 1. CALCULATE METERS HERE
-    let x_m = null;
-    let y_m = null;
-    const mapConfig = MAP_CONFIGS[rawData.map_id];
-
-    if (mapConfig && rawData.x != null && rawData.y != null) {
-      x_m = (rawData.x - mapConfig.origin_x) / mapConfig.ppm;
-      y_m = (mapConfig.origin_y - rawData.y) / mapConfig.ppm;
-    }
 
     const locationData = {
       visitor: {
@@ -1821,11 +1812,6 @@ exports.getVisitorLocation = async (req, res) => {
       location: {
         x: rawData.x || null,
         y: rawData.y || null,
-
-        // 👇 2. ADD THESE TWO LINES
-        x_m: x_m,
-        y_m: y_m,
-
         name: rawData.name || matchedAsset.device_name,
         mac: rawData.mac,
         map_id: rawData.map_id,
@@ -1846,42 +1832,6 @@ exports.getVisitorLocation = async (req, res) => {
       proximity: proximityStatus,
       timestamp: new Date().toISOString(),
     };
-    // const locationData = {
-    //   visitor: {
-    //     id: visitor._id,
-    //     name: visitor.visitorName,
-    //     phone: visitor.phoneNumber,
-    //     email: visitor.email,
-    //     company: visitor.company,
-    //     idNumber: visitor.idNumber,
-    //     purpose: visitor.purpose,
-    //     checkedIn: visitor.checkedIn,
-    //     checkedInAt: visitor.checkedInAt,
-    //     qrExpiresAt: visitor.qrExpiresAt,
-    //   },
-    //   location: {
-    //     x: rawData.x || null,
-    //     y: rawData.y || null,
-    //     name: rawData.name || matchedAsset.device_name,
-    //     mac: rawData.mac,
-    //     map_id: rawData.map_id,
-    //     ap_mac: rawData.ap_mac,
-    //     last_seen: rawData.last_seen,
-    //     rssi: rawData.rssi,
-    //     beam: rawData.beam,
-    //     beam_angle: beamAngle,
-    //     device_name: rawData.device_name,
-    //     manufacture: rawData.manufacture,
-    //     stability: stability,
-    //     is_stable: isStable,
-    //     smoothed_position: matchedAsset.position || null,
-    //     ap_history: matchedAsset.apHistory || [],
-    //   },
-    //   target_coordinates: { x: targetX, y: targetY },
-    //   distance: distance,
-    //   proximity: proximityStatus,
-    //   timestamp: new Date().toISOString(),
-    // };
 
     if (rawData.map_id) {
       const worldCoords = convertMistToWorld(
@@ -2062,41 +2012,11 @@ exports.updateVisitorCabinet = async (req, res) => {
     const newIdNumber = idNumber || assetName;
 
     // Verify asset exists in Mist
-    // try {
-    //   const assets = await fetchAssetLocations();
-    //   const assetExists = assets.some((asset) => {
-    //     const rawData = asset.raw || asset;
-    //     return rawData.name === newIdNumber || rawData.mac === newIdNumber;
-    //   });
-
-    //   if (!assetExists) {
-    //     // Return a list of available assets to help the user
-    //     const assetNames = assets
-    //       .map((a) => a.raw?.name || a.name)
-    //       .filter((name) => name);
-    //     return res.status(400).json({
-    //       success: false,
-    //       message: `Asset "${newIdNumber}" not found in Mist system`,
-    //       available_assets: assetNames,
-    //     });
-    //   }
-    // } catch (error) {
-    //   console.warn("⚠️ Could not verify asset in Mist:", error.message);
-    //   // Proceed anyway – the location endpoint will fail if asset not found
-    // }
-    // Verify asset exists in Mist
     try {
       const assets = await fetchAssetLocations();
-
-      // 👇 FIX: Check if input matches the MAC OR the Name
       const assetExists = assets.some((asset) => {
         const rawData = asset.raw || asset;
-        return (
-          rawData.name === newIdNumber ||
-          rawData.mac === newIdNumber ||
-          asset.name === newIdNumber ||
-          asset.mac === newIdNumber
-        );
+        return rawData.name === newIdNumber || rawData.mac === newIdNumber;
       });
 
       if (!assetExists) {
@@ -2104,19 +2024,17 @@ exports.updateVisitorCabinet = async (req, res) => {
         const assetNames = assets
           .map((a) => a.raw?.name || a.name)
           .filter((name) => name);
-        const assetMacs = assets
-          .map((a) => a.raw?.mac || a.mac)
-          .filter((mac) => mac);
-
         return res.status(400).json({
           success: false,
           message: `Asset "${newIdNumber}" not found in Mist system`,
-          available_assets: [...new Set([...assetNames, ...assetMacs])],
+          available_assets: assetNames,
         });
       }
     } catch (error) {
       console.warn("⚠️ Could not verify asset in Mist:", error.message);
+      // Proceed anyway – the location endpoint will fail if asset not found
     }
+
     // Update idNumber (and other fields if your schema supports them)
     visitor.idNumber = newIdNumber;
     // Uncomment if your model has these fields:
