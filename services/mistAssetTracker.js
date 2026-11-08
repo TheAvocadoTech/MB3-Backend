@@ -22,7 +22,7 @@ const MIN_REFRESH_MS = parseInt(process.env.MIST_MIN_REFRESH_MS, 10) || 5000;
 
 // Path-loss model parameters (RSSI to Distance)
 const PATH_LOSS_EXPONENT = parseFloat(process.env.PATH_LOSS_EXPONENT) || 2.5;
-const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -60;
+const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -60; // Adjusted for tighter indoor bounds
 
 // Smoothing / Jump prevention
 const POSITION_ALPHA = parseFloat(process.env.POSITION_ALPHA) || 0.35;
@@ -30,7 +30,6 @@ const MAX_JUMP_M = parseFloat(process.env.MAX_JUMP_M) || 15;
 
 // ============================================================
 // MAP CONFIGS
-// ⚠️ YOU MUST ADD THE UUID FOR THE FLOOR IN YOUR SCREENSHOT HERE
 // ============================================================
 const MAP_CONFIGS = {
   "30141417-44ea-4982-993c-6225c9f08315": {
@@ -46,15 +45,6 @@ const MAP_CONFIGS = {
     ppm: 57.275559331634064,
     origin_x: 6.786923314266026,
     origin_y: 4134.933029216576,
-    offset_x: 0,
-    offset_y: 0,
-  },
-  // 👇 REPLACE THIS WITH YOUR ACTUAL MAP UUID
-  "YOUR-MAP-UUID-HERE": {
-    name: "Ground Floor",
-    ppm: 50.0, // Pixels per meter (find in map settings)
-    origin_x: 0, // X pixel of meter (0,0)
-    origin_y: 0, // Y pixel of meter (0,0)
     offset_x: 0,
     offset_y: 0,
   },
@@ -174,9 +164,7 @@ class AssetTracker extends EventEmitter {
 
       console.log(
         `✅ Loaded ${this.apMap.size} APs from ap_list.json` +
-          (missingMeters
-            ? ` (${missingMeters} missing x_m/y_m — check MAP_CONFIGS)`
-            : ""),
+          (missingMeters ? ` (${missingMeters} missing x_m/y_m)` : ""),
       );
     } catch (err) {
       console.warn("⚠️ Could not load ap_list.json:", err.message);
@@ -471,8 +459,7 @@ class AssetTracker extends EventEmitter {
         const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
         const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
 
-        // 🛑 STALE TAG FILTER
-        // If the tag was last seen over 2 minutes ago, don't send it to the frontend!
+        // 🛑 DISCARD STALE TAGS (Fixes the "ghost" tag issue)
         if (isStale) {
           console.log(
             `🧹 Discarding stale tag ${mac} (last seen ${Math.round(ageMs / 1000)}s ago)`,
@@ -489,6 +476,7 @@ class AssetTracker extends EventEmitter {
         let x_m = fused?.x_m ?? null;
         let y_m = fused?.y_m ?? null;
 
+        // 1. Fallback to primary detection pixels
         if (x_m == null && primaryDet.x != null && primaryDet.y != null) {
           const m = this._pixelToMeters(
             primaryDet.x,
@@ -501,6 +489,7 @@ class AssetTracker extends EventEmitter {
           }
         }
 
+        // 2. Fallback to AP Info location
         if (x_m == null && apInfo) {
           if (apInfo.x_m != null) {
             x_m = apInfo.x_m;
@@ -514,13 +503,14 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        let smoothed = null;
+        // 3. Smoothing
         if (x_m != null && y_m != null) {
-          smoothed = this._smoothPosition(mac, x_m, y_m);
+          const smoothed = this._smoothPosition(mac, x_m, y_m);
           x_m = smoothed.x_m;
           y_m = smoothed.y_m;
         }
 
+        // 4. Convert back to Pixels
         let x_px = null;
         let y_px = null;
         if (x_m != null && y_m != null) {
@@ -541,10 +531,14 @@ class AssetTracker extends EventEmitter {
           device_name: firstDet.device_name || "Unknown Tag",
           map_id: firstDet.map_id,
           map_name: this.mapMap.get(firstDet.map_id) || null,
-          x_m,
-          y_m,
+
+          // 👇 FINAL FIXED METERS
+          x_m: x_m,
+          y_m: y_m,
+
           x: x_px,
           y: y_px,
+
           location_method: fused?.method || "fallback",
           location_contributing_aps: fused?.contributing ?? detectionsCount,
           ap_mac: primaryDet.ap_mac,
@@ -556,7 +550,7 @@ class AssetTracker extends EventEmitter {
           location_confidence: locationConfidence,
           last_seen: lastSeenMs,
           age_ms: ageMs,
-          is_stale: false, // It's always false here since we discard stale tags above
+          is_stale: false,
           updated_at: new Date().toISOString(),
           detections: slimDetections,
         });
