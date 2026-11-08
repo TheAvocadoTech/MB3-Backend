@@ -22,7 +22,7 @@ const MIN_REFRESH_MS = parseInt(process.env.MIST_MIN_REFRESH_MS, 10) || 5000;
 
 // Path-loss model parameters (RSSI to Distance)
 const PATH_LOSS_EXPONENT = parseFloat(process.env.PATH_LOSS_EXPONENT) || 2.5;
-const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -45;
+const RSSI_AT_1M = parseFloat(process.env.RSSI_AT_1M) || -60;
 
 // Smoothing / Jump prevention
 const POSITION_ALPHA = parseFloat(process.env.POSITION_ALPHA) || 0.35;
