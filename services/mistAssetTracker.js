@@ -30,7 +30,7 @@ const MAX_JUMP_M = parseFloat(process.env.MAX_JUMP_M) || 15;
 
 // ============================================================
 // MAP CONFIGS
-// IMPORTANT: Add all map UUIDs used in your site here.
+// ⚠️ YOU MUST ADD THE UUID FOR THE FLOOR IN YOUR SCREENSHOT HERE
 // ============================================================
 const MAP_CONFIGS = {
   "30141417-44ea-4982-993c-6225c9f08315": {
@@ -49,16 +49,15 @@ const MAP_CONFIGS = {
     offset_x: 0,
     offset_y: 0,
   },
-  // ⚠️ FILL THIS IN FOR THE FLOOR IN YOUR SCREENSHOT:
-  // Go to Mist Dashboard -> Maps -> [Your Map] -> Copy UUID from URL.
-  // "YOUR-MAP-UUID-HERE": {
-  //   name: "Ground Floor",
-  //   ppm: 50.0,       // Pixels per meter (find in map settings)
-  //   origin_x: 0,     // X pixel of meter (0,0)
-  //   origin_y: 0,     // Y pixel of meter (0,0)
-  //   offset_x: 0,
-  //   offset_y: 0,
-  // },
+  // 👇 REPLACE THIS WITH YOUR ACTUAL MAP UUID
+  "YOUR-MAP-UUID-HERE": {
+    name: "Ground Floor",
+    ppm: 50.0, // Pixels per meter (find in map settings)
+    origin_x: 0, // X pixel of meter (0,0)
+    origin_y: 0, // Y pixel of meter (0,0)
+    offset_x: 0,
+    offset_y: 0,
+  },
 };
 
 const mist = axios.create({
@@ -70,7 +69,6 @@ const mist = axios.create({
   timeout: 10000,
 });
 
-// Safely stringify for Redis
 const safeJson = (obj) => {
   try {
     return JSON.stringify(obj, (k, v) =>
@@ -82,25 +80,22 @@ const safeJson = (obj) => {
   }
 };
 
-// Convert dBm to estimated meters
 function rssiToDistance(rssi) {
   if (rssi == null || !Number.isFinite(rssi)) return null;
   const d = Math.pow(10, (RSSI_AT_1M - rssi) / (10 * PATH_LOSS_EXPONENT));
   return Math.min(Math.max(d, 0.3), 100);
 }
 
-// Weight detections based on signal strength (linear power ratio)
 function rssiWeight(rssi) {
   if (rssi == null || !Number.isFinite(rssi)) return 0;
   const clamped = Math.max(rssi, -100);
   return Math.pow(10, clamped / 10);
 }
 
-// Ensure beam is a valid integer
 function coerceBeam(b) {
   const n = Number(b);
   if (!Number.isFinite(n) || n < 0) return null;
-  return Math.round(n); // Allow 0-63, do not strictly cap at 7
+  return Math.round(n);
 }
 
 class AssetTracker extends EventEmitter {
@@ -109,7 +104,7 @@ class AssetTracker extends EventEmitter {
     this.cachedProcessedAssets = [];
     this.apMap = new Map();
     this.mapMap = new Map();
-    this.smoothedByMac = new Map(); // Tracks smoothing state per tag
+    this.smoothedByMac = new Map();
     this.lastFetchAt = 0;
     this.inflight = null;
 
@@ -129,9 +124,6 @@ class AssetTracker extends EventEmitter {
     this._hydrateFromRedis();
   }
 
-  // ============================================================
-  // AP LIST LOADING
-  // ============================================================
   _loadStaticAPs() {
     try {
       const filePath = path.join(__dirname, "ap_list.json");
@@ -152,7 +144,6 @@ class AssetTracker extends EventEmitter {
         let x_m = ap.x_m;
         let y_m = ap.y_m;
 
-        // Auto-convert pixels to meters if missing
         if (
           (x_m == null || y_m == null) &&
           ap.map_id &&
@@ -234,18 +225,10 @@ class AssetTracker extends EventEmitter {
     }
   }
 
-  // ============================================================
-  // FETCHING & CACHING
-  // ============================================================
   async getAssets() {
-    if (Date.now() - this.lastFetchAt < MIN_REFRESH_MS) {
+    if (Date.now() - this.lastFetchAt < MIN_REFRESH_MS)
       return this.cachedProcessedAssets;
-    }
-
-    if (await this._isBackedOff()) {
-      return this.cachedProcessedAssets;
-    }
-
+    if (await this._isBackedOff()) return this.cachedProcessedAssets;
     if (this.inflight) return this.inflight;
 
     this.inflight = this._fetchAndCache().finally(() => {
@@ -292,9 +275,6 @@ class AssetTracker extends EventEmitter {
     }
   }
 
-  // ============================================================
-  // COORDINATE CONVERSIONS
-  // ============================================================
   _pixelToMeters(x, y, mapId) {
     if (x == null || y == null) return null;
     const cfg = MAP_CONFIGS[mapId];
@@ -315,9 +295,6 @@ class AssetTracker extends EventEmitter {
     };
   }
 
-  // ============================================================
-  // FUSION ENGINE
-  // ============================================================
   _computeFusedLocation(mac, detections, mapId) {
     const weightedPoints = [];
 
@@ -329,14 +306,11 @@ class AssetTracker extends EventEmitter {
       let y_m = null;
       let source = null;
 
-      // 1. Mist gave metric coords directly
       if (det.x_m != null && det.y_m != null) {
         x_m = det.x_m;
         y_m = det.y_m;
         source = "det_metric";
-      }
-      // 2. Mist gave pixel coords — convert them
-      else if (det.x != null && det.y != null) {
+      } else if (det.x != null && det.y != null) {
         const m = this._pixelToMeters(det.x, det.y, mapId);
         if (m) {
           x_m = m.x_m;
@@ -345,7 +319,6 @@ class AssetTracker extends EventEmitter {
         }
       }
 
-      // 3. Fallback to AP location + beam projection
       if (x_m == null && apStatic) {
         let baseX = apStatic.x_m;
         let baseY = apStatic.y_m;
@@ -372,7 +345,6 @@ class AssetTracker extends EventEmitter {
           const beam = coerceBeam(det.beam);
 
           if (dist != null && beam != null) {
-            // Beam 0 is North, 1 is NE, etc.
             const angleRad = (beam * 45 * Math.PI) / 180;
             x_m = baseX + dist * Math.sin(angleRad);
             y_m = baseY + dist * Math.cos(angleRad);
@@ -403,9 +375,9 @@ class AssetTracker extends EventEmitter {
 
     if (weightedPoints.length === 0) return null;
 
-    let sumW = 0;
-    let sumX = 0;
-    let sumY = 0;
+    let sumW = 0,
+      sumX = 0,
+      sumY = 0;
     for (const p of weightedPoints) {
       sumW += p.weight;
       sumX += p.weight * p.x_m;
@@ -421,9 +393,6 @@ class AssetTracker extends EventEmitter {
     };
   }
 
-  // ============================================================
-  // SMOOTHING (EMA + Jump Damping)
-  // ============================================================
   _smoothPosition(mac, x_m, y_m) {
     const prev = this.smoothedByMac.get(mac);
     if (!prev) {
@@ -435,11 +404,8 @@ class AssetTracker extends EventEmitter {
     const dy = y_m - prev.y_m;
     const dist = Math.sqrt(dx * dx + dy * dy);
 
-    // If it jumps more than MAX_JUMP_M (e.g. 15 meters), soften the movement
     let alpha = POSITION_ALPHA;
-    if (dist > MAX_JUMP_M) {
-      alpha = POSITION_ALPHA * (MAX_JUMP_M / dist);
-    }
+    if (dist > MAX_JUMP_M) alpha = POSITION_ALPHA * (MAX_JUMP_M / dist);
 
     const sx = prev.x_m + alpha * dx;
     const sy = prev.y_m + alpha * dy;
@@ -447,14 +413,10 @@ class AssetTracker extends EventEmitter {
     return { x_m: sx, y_m: sy };
   }
 
-  // ============================================================
-  // PROCESSING
-  // ============================================================
   _processAssetData(assets) {
     const processedAssets = [];
     const assetGroups = new Map();
 
-    // Group multiple AP detections by tag MAC
     for (const a of assets) {
       if (!a.mac) continue;
       let group = assetGroups.get(a.mac);
@@ -468,10 +430,7 @@ class AssetTracker extends EventEmitter {
     for (const [mac, detections] of assetGroups) {
       try {
         const firstDet = detections[0];
-        if (!firstDet.map_id) {
-          console.warn(`Asset ${mac} has no map_id — skipping`);
-          continue;
-        }
+        if (!firstDet.map_id) continue;
 
         const sortedDetections = [...detections].sort(
           (a, b) => (b.rssi ?? -999) - (a.rssi ?? -999),
@@ -512,14 +471,21 @@ class AssetTracker extends EventEmitter {
         const ageMs = lastSeenMs ? Date.now() - lastSeenMs : null;
         const isStale = ageMs != null ? ageMs > STALE_THRESHOLD_MS : true;
 
-        // 1. Fuse
+        // 🛑 STALE TAG FILTER
+        // If the tag was last seen over 2 minutes ago, don't send it to the frontend!
+        if (isStale) {
+          console.log(
+            `🧹 Discarding stale tag ${mac} (last seen ${Math.round(ageMs / 1000)}s ago)`,
+          );
+          continue;
+        }
+
         const fused = this._computeFusedLocation(
           mac,
           sortedDetections,
           firstDet.map_id,
         );
 
-        // 2. Resolve Final Metric Coords
         let x_m = fused?.x_m ?? null;
         let y_m = fused?.y_m ?? null;
 
@@ -548,7 +514,6 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // 3. Smoothing
         let smoothed = null;
         if (x_m != null && y_m != null) {
           smoothed = this._smoothPosition(mac, x_m, y_m);
@@ -556,7 +521,6 @@ class AssetTracker extends EventEmitter {
           y_m = smoothed.y_m;
         }
 
-        // 4. Back to Pixels for UI
         let x_px = null;
         let y_px = null;
         if (x_m != null && y_m != null) {
@@ -567,7 +531,6 @@ class AssetTracker extends EventEmitter {
           }
         }
 
-        // Fallback for UI pixel coords
         if (x_px == null && primaryDet.x != null) {
           x_px = primaryDet.x;
           y_px = primaryDet.y;
@@ -578,34 +541,23 @@ class AssetTracker extends EventEmitter {
           device_name: firstDet.device_name || "Unknown Tag",
           map_id: firstDet.map_id,
           map_name: this.mapMap.get(firstDet.map_id) || null,
-
-          // METRIC (Meters) - Feeds UI diagnostics
           x_m,
           y_m,
-
-          // PIXELS - Feeds UI Map Marker
           x: x_px,
           y: y_px,
-
           location_method: fused?.method || "fallback",
           location_contributing_aps: fused?.contributing ?? detectionsCount,
-
-          // BLE Diagnostics
           ap_mac: primaryDet.ap_mac,
           ap_name: apInfo?.name || primaryDet.ap_mac,
           rssi: primaryDet.rssi,
           beam: coerceBeam(primaryDet.beam),
-
           radius: primaryDet.radius || DEFAULT_ASSET_RADIUS_M,
           detections_count: detectionsCount,
           location_confidence: locationConfidence,
-
           last_seen: lastSeenMs,
           age_ms: ageMs,
-          is_stale: isStale,
+          is_stale: false, // It's always false here since we discard stale tags above
           updated_at: new Date().toISOString(),
-
-          // Raw array of all APs that heard this tag
           detections: slimDetections,
         });
       } catch (err) {
@@ -623,3 +575,4 @@ class AssetTracker extends EventEmitter {
 
 const assetTracker = new AssetTracker();
 module.exports = assetTracker;
+c;
