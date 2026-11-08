@@ -2062,11 +2062,41 @@ exports.updateVisitorCabinet = async (req, res) => {
     const newIdNumber = idNumber || assetName;
 
     // Verify asset exists in Mist
+    // try {
+    //   const assets = await fetchAssetLocations();
+    //   const assetExists = assets.some((asset) => {
+    //     const rawData = asset.raw || asset;
+    //     return rawData.name === newIdNumber || rawData.mac === newIdNumber;
+    //   });
+
+    //   if (!assetExists) {
+    //     // Return a list of available assets to help the user
+    //     const assetNames = assets
+    //       .map((a) => a.raw?.name || a.name)
+    //       .filter((name) => name);
+    //     return res.status(400).json({
+    //       success: false,
+    //       message: `Asset "${newIdNumber}" not found in Mist system`,
+    //       available_assets: assetNames,
+    //     });
+    //   }
+    // } catch (error) {
+    //   console.warn("⚠️ Could not verify asset in Mist:", error.message);
+    //   // Proceed anyway – the location endpoint will fail if asset not found
+    // }
+    // Verify asset exists in Mist
     try {
       const assets = await fetchAssetLocations();
+
+      // 👇 FIX: Check if input matches the MAC OR the Name
       const assetExists = assets.some((asset) => {
         const rawData = asset.raw || asset;
-        return rawData.name === newIdNumber || rawData.mac === newIdNumber;
+        return (
+          rawData.name === newIdNumber ||
+          rawData.mac === newIdNumber ||
+          asset.name === newIdNumber ||
+          asset.mac === newIdNumber
+        );
       });
 
       if (!assetExists) {
@@ -2074,17 +2104,19 @@ exports.updateVisitorCabinet = async (req, res) => {
         const assetNames = assets
           .map((a) => a.raw?.name || a.name)
           .filter((name) => name);
+        const assetMacs = assets
+          .map((a) => a.raw?.mac || a.mac)
+          .filter((mac) => mac);
+
         return res.status(400).json({
           success: false,
           message: `Asset "${newIdNumber}" not found in Mist system`,
-          available_assets: assetNames,
+          available_assets: [...new Set([...assetNames, ...assetMacs])],
         });
       }
     } catch (error) {
       console.warn("⚠️ Could not verify asset in Mist:", error.message);
-      // Proceed anyway – the location endpoint will fail if asset not found
     }
-
     // Update idNumber (and other fields if your schema supports them)
     visitor.idNumber = newIdNumber;
     // Uncomment if your model has these fields:
